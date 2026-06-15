@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated data / large files
+data/
+*/data/
+*.npy
+*.npz
+*.root
+*.lhe
+*.lhe.gz
+*.hepmc
+*.parquet
+*.h5
+*.hdf5
+
+# Logs and outputs
+*.log
+outputs/
+runs/
+figures/
+event_figures/
+jet_images/
+
+# Build/package artifacts
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
