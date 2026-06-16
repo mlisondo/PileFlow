@@ -2,6 +2,7 @@
 Pipeline stages for the PileFlow generator.
 """
 
+from pileflow_generator.stages.madgraph import MadGraphRunner
 from pileflow_generator.stages.pythia import PythiaRunner
 
 from pileflow_generator.stages.temporary_baseline_puppi import (
@@ -35,6 +36,7 @@ from pileflow_generator.stages.features import (
 )
 
 __all__ = [
+    "MadGraphRunner",
     "PythiaRunner",
 
     "Particle",
