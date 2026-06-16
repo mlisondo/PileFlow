@@ -2,7 +2,9 @@
 Pipeline stages for the PileFlow generator.
 """
 
-from .temporary_baseline_puppi import (
+from pileflow_generator.stages.pythia import PythiaRunner
+
+from pileflow_generator.stages.temporary_baseline_puppi import (
     Particle,
     unpack_particles,
     characterise_pileup,
@@ -10,18 +12,19 @@ from .temporary_baseline_puppi import (
     run_puppi_on_dataset,
 )
 
-from .pileup import (
+from pileflow_generator.stages.pileup import (
     TaggedParticle,
     PileupOverlay,
     tagged_from_snapshot,
 )
 
-from .images import (
+from pileflow_generator.stages.images import (
     JetImageBuilder,
     produce_images,
 )
 
 __all__ = [
+    "PythiaRunner",
     "Particle",
     "unpack_particles",
     "characterise_pileup",
