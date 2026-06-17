@@ -8,6 +8,18 @@ These functions are not general kinematics. They are part of the generator's
 feature-building stage.
 """
 
+from __future__ import annotations
+
+from typing import Sequence
+
+from pileflow_generator.physics.pdg import (
+    B_HADRON_IDS_ABS,
+    C_HADRON_IDS_ABS,
+    LONG_LIVED_IDS_ABS,
+)
+from pileflow_generator.physics.smearing import apply_detector_smearing
+from pileflow_generator.schemas.jet_features import N_FEATURES
+
 import numpy as np
 
 # utils/helpers.py
@@ -101,17 +113,6 @@ def quark_gluon_likelihood(fracs: dict) -> float:
 
 
 
-from __future__ import annotations
-
-from typing import Sequence
-
-from pileflow_generator.physics.pdg import (
-    B_HADRON_IDS_ABS,
-    C_HADRON_IDS_ABS,
-    LONG_LIVED_IDS_ABS,
-)
-from pileflow_generator.physics.smearing import apply_detector_smearing
-from pileflow_generator.schemas.jet_features import N_FEATURES
 
 # reconstructor.py
 def compute_fractions(const_info: Sequence[tuple]) -> dict:
