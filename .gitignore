@@ -41,3 +41,9 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# Local PileFlow generator smoke-test outputs
+generator/data_test_*/
+generator/mg5_auto_*.txt
+generator/smoke_test_auto_mg5/
+generator/py.py
