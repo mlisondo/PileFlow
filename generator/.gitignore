@@ -1,0 +1,23 @@
+# Generator-specific temporary outputs
+
+# Local test / debugging outputs
+data_test_*/
+data_notebook/
+
+# MadGraph auto-generated scripts
+mg5_auto_*.txt
+
+# MadGraph
+py.py
+parsetab.py
+parser.out
+
+# MadGraph process-output folders
+Events/
+HTML/
+Cards/
+SubProcesses/
+Source/
+lib/
+bin/
+madevent/
