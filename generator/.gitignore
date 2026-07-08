@@ -21,3 +21,8 @@ Source/
 lib/
 bin/
 madevent/
+
+# Local MadGraph process directories
+local_auto_mg5_smoke/
+local_auto_mg5_smoke_puppi_pkg/
+mg5_auto_*.txt
