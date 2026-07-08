@@ -283,7 +283,6 @@ dependencies:
       - pastel==0.2.1
       - patsy==1.0.2
       - pexpect==4.9.0
-      - pileflow-generator==0.0.0
       - platformdirs==4.10.0
       - poethepoet==0.10.0
       - pot==0.9.7

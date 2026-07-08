@@ -1,0 +1,21 @@
+# Local machine/environment diagnostics
+conda-envs.txt
+conda-info.txt
+current-env.txt
+system-report.txt
+
+# Redundant or non-portable environment exports
+environment-full.yml
+environment-from-history.yml
+conda-explicit.txt
+
+# Local git snapshot artifacts
+git-commit.txt
+git-diff.patch
+git-files.txt
+git-status.txt
+
+# Redundant pip reports / local checks
+pip-check.txt
+pip-list-freeze.txt
+pip-list-readable.txt
