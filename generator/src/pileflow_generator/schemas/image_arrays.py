@@ -87,11 +87,25 @@ CONSTITUENT_KEYS = [
     for component in CONSTITUENT_COMPONENTS
 ]
 
+# Full LV + PU particle arrays before PUPPI.
+#
+# These are saved so that standalone PUPPI can be rerun after generation.
+# They include charge and LV/PU truth labels, which are required by PUPPI.
+FULL_EVENT_KEYS = [
+    "full_px",
+    "full_py",
+    "full_pz",
+    "full_e",
+    "full_charge",
+    "full_is_lv",
+    "full_n",
+]
 
 REQUIRED_NPZ_KEYS = (
     IMAGE_KEYS
     + JET_METADATA_KEYS
     + CONSTITUENT_KEYS
+    + FULL_EVENT_KEYS
 )
 
 
@@ -122,6 +136,13 @@ CONSTITUENT_SHAPES = {
     "puppi_pz": ("N", MAX_CONST),
     "puppi_e": ("N", MAX_CONST),
     "puppi_n": ("N",),
+    "full_px": ("N", MAX_CONST),
+    "full_py": ("N", MAX_CONST),
+    "full_pz": ("N", MAX_CONST),
+    "full_e": ("N", MAX_CONST),
+    "full_charge": ("N", MAX_CONST),
+    "full_is_lv": ("N", MAX_CONST),
+    "full_n": ("N",),
 }
 
 
@@ -160,4 +181,11 @@ def empty_image_arrays(n_charged: int = N_PIXELS_CHARGED, n_neutral: int = N_PIX
         "puppi_pz": np.empty((0, MAX_CONST), dtype=np.float32),
         "puppi_e": np.empty((0, MAX_CONST), dtype=np.float32),
         "puppi_n": np.empty(0, dtype=np.int32),
+        "full_px": np.empty((0, MAX_CONST), dtype=np.float32),
+        "full_py": np.empty((0, MAX_CONST), dtype=np.float32),
+        "full_pz": np.empty((0, MAX_CONST), dtype=np.float32),
+        "full_e": np.empty((0, MAX_CONST), dtype=np.float32),
+        "full_charge": np.empty((0, MAX_CONST), dtype=np.float32),
+        "full_is_lv": np.empty((0, MAX_CONST), dtype=np.float32),
+        "full_n": np.empty(0, dtype=np.int32),
     }

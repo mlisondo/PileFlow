@@ -47,6 +47,16 @@ IMAGE_ACCUMULATION_KEYS = [
     "jet_phi",
     "n_pu",
 
+    # Full LV + PU particles before PUPPI.
+    # These are needed to rerun PUPPI standalone after generation.
+    "full_px",
+    "full_py",
+    "full_pz",
+    "full_e",
+    "full_charge",
+    "full_is_lv",
+    "full_n",
+
     # True LV-only constituents.
     "true_px",
     "true_py",

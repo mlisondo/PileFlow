@@ -35,10 +35,11 @@ from pileflow_generator.stages.pileup import (
     _is_stable_visible,
     tagged_from_snapshot,
 )
-from pileflow_generator.stages.temporary_baseline_puppi import (
-    Particle as PuppiParticle,
-    run_puppi,
-)
+# from pileflow_generator.stages.temporary_baseline_puppi import (
+#     Particle as PuppiParticle,
+#     run_puppi,
+# )
+from puppi import Particle as PuppiParticle, run_puppi
 
 
 class JetImageBuilder:
@@ -207,6 +208,42 @@ def _pack_constituents(pseudojets: list) -> dict[str, np.ndarray | np.int32]:
         "py": py,
         "pz": pz,
         "e": e,
+        "n": np.int32(n),
+    }
+
+def _pack_tagged_particles(
+    particles: list[TaggedParticle],
+) -> dict[str, np.ndarray | np.int32]:
+    """
+    Pack full LV + PU TaggedParticles into fixed-length zero-padded arrays.
+
+    This is the pre-PUPPI particle collection. It includes charge and LV/PU
+    truth labels so that PUPPI can be rerun standalone after generation.
+    """
+    n = min(len(particles), MAX_CONST)
+
+    px = np.zeros(MAX_CONST, dtype=np.float32)
+    py = np.zeros(MAX_CONST, dtype=np.float32)
+    pz = np.zeros(MAX_CONST, dtype=np.float32)
+    e = np.zeros(MAX_CONST, dtype=np.float32)
+    charge = np.zeros(MAX_CONST, dtype=np.float32)
+    is_lv = np.zeros(MAX_CONST, dtype=np.float32)
+
+    for i, p in enumerate(particles[:n]):
+        px[i] = float(p.px)
+        py[i] = float(p.py)
+        pz[i] = float(p.pz)
+        e[i] = float(p.e)
+        charge[i] = float(p.charge)
+        is_lv[i] = 1.0 if p.is_lv else 0.0
+
+    return {
+        "px": px,
+        "py": py,
+        "pz": pz,
+        "e": e,
+        "charge": charge,
+        "is_lv": is_lv,
         "n": np.int32(n),
     }
 
@@ -387,6 +424,13 @@ def _initial_results() -> dict[str, list]:
         "jet_eta": [],
         "jet_phi": [],
         "n_pu": [],
+        "full_px": [],
+        "full_py": [],
+        "full_pz": [],
+        "full_e": [],
+        "full_charge": [],
+        "full_is_lv": [],
+        "full_n": [],
         "true_px": [],
         "true_py": [],
         "true_pz": [],
@@ -414,6 +458,18 @@ def _append_packed(results: dict[str, list], prefix: str, packed: dict) -> None:
     results[f"{prefix}_pz"].append(packed["pz"])
     results[f"{prefix}_e"].append(packed["e"])
     results[f"{prefix}_n"].append(packed["n"])
+
+def _append_full_packed(results: dict[str, list], packed: dict) -> None:
+    """
+    Append one packed full-event LV+PU payload into ``results``.
+    """
+    results["full_px"].append(packed["px"])
+    results["full_py"].append(packed["py"])
+    results["full_pz"].append(packed["pz"])
+    results["full_e"].append(packed["e"])
+    results["full_charge"].append(packed["charge"])
+    results["full_is_lv"].append(packed["is_lv"])
+    results["full_n"].append(packed["n"])
 
 
 def produce_images(
@@ -465,6 +521,10 @@ def produce_images(
     else:
         clean_particles = _clean_particles_from_hard_event(hard_event)
         pu_particles = overlay.overlay(hard_event, n_pu=n_pu)
+
+    # Save the full LV+PU particle collection before PUPPI.
+    # This is duplicated for each saved jet from this event.
+    full_packed = _pack_tagged_particles(pu_particles)
 
     # Run PUPPI on the full LV+PU event.
     puppi_input = [
@@ -524,6 +584,8 @@ def produce_images(
         results["jet_phi"].append(jet_phi)
         results["n_pu"].append(int(n_pu))
 
+        _append_full_packed(results, full_packed)
+
         # True constituents.
         matched = _match_jet(jet_eta, jet_phi, lv_jets)
         packed = (
@@ -569,6 +631,7 @@ def produce_images(
             f"  ch_neutral_all   : {final['ch_neutral_all'].shape} (contaminated)\n"
             f"  ch_neutral_lv    : {final['ch_neutral_lv'].shape} (PUMML target)\n"
             f"  clean_neutral_all: {final['clean_neutral_all'].shape} (True curve)\n"
+            f"  full particles   : {final['full_px'].shape}\n"
             f"  true consts      : {final['true_px'].shape}\n"
             f"  pileup consts    : {final['pileup_px'].shape}\n"
             f"  puppi consts     : {final['puppi_px'].shape}"
