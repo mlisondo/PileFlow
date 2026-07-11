@@ -2,19 +2,24 @@
 flows/config.py
 ===============
 
-Central configuration for the PileFlow model pipeline.
+Central configuration for the image-only PileFlow pipeline.
 
 Pipeline stages:
-  Stage 1 — Load generator data  (jets.npy + jets_pileup_images.npz)
-  Stage 2 — Train PileFlow flow model
-  Stage 3 — Generate mitigated jets  (generated_jets.npz)
-  Stage 4 — Compare + plot
+  Stage 1 — Load generated jet images from jets_pileup_images.npz
+  Stage 2 — Train PileFlow using only three image channels
+  Stage 3 — Generate the neutral-LV 9x9 image
+  Stage 4 — Compare and plot predictions
 
-External tools:
-  pumml_ckpt : optional trained PUMML checkpoint used only for comparison.
+PileFlow input channels:
+  1. ch_neutral_all_raw  — contaminated neutral image, 9x9
+  2. ch_charged_pu       — charged pileup image, pooled 36x36 -> 9x9
+  3. ch_charged_lv       — charged leading-vertex image, pooled 36x36 -> 9x9
+
+PileFlow target:
+  ch_neutral_lv          — neutral leading-vertex image, 9x9
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -30,7 +35,8 @@ class Config:
     skip_eval: bool = False
 
     # Precomputed paths
-    data_npy: Optional[str] = None
+    #
+    # Image-only PileFlow no longer requires the generator scalar .npy table.
     data_npz: Optional[str] = None
     flow_ckpt: Optional[str] = None
     pumml_ckpt: Optional[str] = None
@@ -52,17 +58,52 @@ class Config:
     # Generation / evaluation
     eval_batch: int = 512
 
-    # Generator feature indices
-    GEN_SCALAR_IDX: list = field(default_factory=lambda: [0, 1, 2, 3, 9, 22, 24])
-    GEN_FLAVOUR_IDX: int = 4
+    # Image-only model contract
+    image_channel_keys: tuple[str, str, str] = (
+        "ch_neutral_all_raw",
+        "ch_charged_pu",
+        "ch_charged_lv",
+    )
+    target_key: str = "ch_neutral_lv"
+
+    image_size: int = 9
+    charged_image_size: int = 36
 
     @property
-    def n_target(self) -> int:
-        return 97
+    def charged_pool_factor(self) -> int:
+        """
+        Pool each 36x36 charged image into a 9x9 image.
+
+        Each output pixel contains the sum of one 4x4 block, preserving
+        the total transverse momentum.
+        """
+        return self.charged_image_size // self.image_size
+
+    @property
+    def n_image_channels(self) -> int:
+        return len(self.image_channel_keys)
 
     @property
     def context_dim(self) -> int:
-        return len(self.GEN_SCALAR_IDX) + 3 + 3 * 81
+        """
+        Three flattened 9x9 input images:
+
+            3 * 9 * 9 = 243
+        """
+        return self.n_image_channels * self.image_size**2
+
+    @property
+    def n_target(self) -> int:
+        """
+        One flattened neutral-LV 9x9 target image:
+
+            9 * 9 = 81
+        """
+        return self.image_size**2
+
+    @property
+    def n_scalars(self) -> int:
+        return 0
 
     # Generic
     device: str = "cpu"

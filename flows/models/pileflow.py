@@ -1,350 +1,711 @@
 """
 flows/models/pileflow.py
-================================
-PileFlow: end-to-end pileup mitigation via Target Conditional Flow Matching.
+========================
 
-Extends FlowSim (Vaselli et al. arXiv:2402.13684) to the pileup-mitigation
-problem.  Given pileup-contaminated jet images and generator-level context,
-the flow jointly generates:
+PileFlow: pileup mitigation using Target Conditional Flow Matching.
 
-  (a) the pileup-mitigated neutral LV image  (9x9 -> 81 dims)
-  (b) reconstructed scalar jet observables   (16 dims)
+The image-only model is conditioned exclusively on three jet-image channels:
 
-Context vector Y (253 dims total):
-  [0:7]     7  gen scalar features     (pt_gen, eta, phi, m, muon_pT, jetR, jetArea)
-  [7:10]    3  flavour one-hot         (light/gluon=0, c=1, b=2)
-  [10:91]  81  ch_neutral_all @ 9x9   (total neutral pT incl. pileup)
-  [91:172] 81  ch_charged_pu  @ 9x9   (charged pileup pT)
-  [172:253]81  ch_charged_lv  @ 9x9   (charged LV pT)
+    1. ch_neutral_all_raw  : contaminated neutral pT image
+    2. ch_charged_pu       : charged pileup pT image
+    3. ch_charged_lv       : charged leading-vertex pT image
 
-Target vector X (97 dims total):
-  [0:81]   81  neutral_lv @ 9x9, standardised   (what the flow generates)
-  [81:97]  16  scalar jet observables, standardised
+All three channels are represented internally as flattened 9x9 images.
+
+Context vector Y:
+    [0:81]    ch_neutral_all_raw
+    [81:162]  ch_charged_pu
+    [162:243] ch_charged_lv
+
+Target vector X:
+    [0:81]    ch_neutral_lv
+
+The flow therefore learns:
+
+    v_theta(z_t, t, Y): R^81 x R x R^243 -> R^81
 
 References:
-  Vaselli et al. arXiv:2402.13684v2  (FlowSim)
-  Lipman et al.  arXiv:2210.02747   (Flow Matching)
-  Komiske et al. arXiv:1707.08600   (PUMML)
+    Vaselli et al. arXiv:2402.13684v2
+    Lipman et al. arXiv:2210.02747
+    Komiske et al. arXiv:1707.08600
 """
 
+from __future__ import annotations
+
 import math
+
 import torch
 import torch.nn as nn
 
-# Dimensionalities
-IMG_DIM      = 81    # 9×9 neutral-LV image, flattened
-N_SCALARS    = 16    # scalar observables target
-N_TARGET     = IMG_DIM + N_SCALARS          # 97
-N_GEN_SCALAR = 7                            # pt_gen, eta, phi, m, muon_pT, jetR, jetArea
-N_FLAVOUR    = 3                            # one-hot: light/gluon, c, b
-N_IMAGES     = 3                            # neutral_all + charged_pu + charged_lv
-N_CONTEXT    = N_GEN_SCALAR + N_FLAVOUR + N_IMAGES * IMG_DIM  # 253
+
+# Image-only dimensionalities
+IMG_DIM = 81
+N_IMAGES = 3
+N_SCALARS = 0
+N_TARGET = IMG_DIM
+N_CONTEXT = N_IMAGES * IMG_DIM
 
 
+# ---------------------------------------------------------------------------
+# Velocity-field components
+# ---------------------------------------------------------------------------
 
-# Velocity field components
 class SinusoidalTimeEmb(nn.Module):
-    """Fixed sinusoidal time embedding — same as DDPM / FlowSim."""
+    """Fixed sinusoidal time embedding, as used in DDPM and FlowSim."""
 
     def __init__(self, dim: int):
         super().__init__()
-        assert dim % 2 == 0
+
+        if dim <= 0 or dim % 2 != 0:
+            raise ValueError(
+                f"time embedding dimension must be a positive even integer, got {dim}"
+            )
+
         self.dim = dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half  = self.dim // 2
+        half = self.dim // 2
+
         freqs = torch.exp(
-            -math.log(10_000) * torch.arange(half, device=t.device) / max(half - 1, 1)
+            -math.log(10_000)
+            * torch.arange(half, device=t.device, dtype=t.dtype)
+            / max(half - 1, 1)
         )
+
         args = t[:, None] * freqs[None, :]
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
 class ResBlock(nn.Module):
     """
-    Residual block: h_new = LayerNorm(h + Dropout(fc2(SiLU(fc1([h | cond])))))
+    Residual block with repeated time and image conditioning.
 
-    The conditioning vector (time_emb + context) is injected at every block.
-    """
+    The update is approximately:
 
-    def __init__(self, hidden_dim: int, cond_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.fc1     = nn.Linear(hidden_dim + cond_dim, hidden_dim)
-        self.fc2     = nn.Linear(hidden_dim, hidden_dim)
-        self.act     = nn.SiLU()
-        self.norm    = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(p=dropout)
-
-    def forward(self, h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        return self.norm(h + self.dropout(self.fc2(self.act(self.fc1(
-            torch.cat([h, cond], dim=-1)
-        )))))
-
-
-class CRTVelocityField(nn.Module):
-    """
-    Continuous ResNet Target (CRT) velocity field  v_θ(z_t, t, Y).
-
-    Learns the velocity field for the flow-matching ODE:
-        dz/dt = v_θ(z_t, t, Y)
-
-    Parameters
-    ----------
-    n_features   : target dimension (97 = 81 img + 16 scalars)
-    context_dim  : context dimension (253)
-    hidden_dim   : ResNet hidden width (default 512)
-    n_blocks     : number of residual blocks (default 8)
-    time_emb_dim : sinusoidal time embedding dimension (default 64)
-    dropout      : dropout in ResBlocks (set 0 at inference)
+        h_new = LayerNorm(
+            h + Dropout(fc2(SiLU(fc1([h, condition]))))
+        )
     """
 
     def __init__(
         self,
-        n_features:   int,
-        context_dim:  int,
-        hidden_dim:   int   = 512,
-        n_blocks:     int   = 8,
-        time_emb_dim: int   = 64,
-        dropout:      float = 0.1,
+        hidden_dim: int,
+        cond_dim: int,
+        dropout: float = 0.1,
     ):
         super().__init__()
-        self.n_features  = n_features
+
+        self.fc1 = nn.Linear(hidden_dim + cond_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.SiLU()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = self.fc1(torch.cat([h, cond], dim=-1))
+        residual = self.act(residual)
+        residual = self.fc2(residual)
+        residual = self.dropout(residual)
+
+        return self.norm(h + residual)
+
+
+class CRTVelocityField(nn.Module):
+    """
+    Continuous ResNet Target velocity field:
+
+        v_theta(z_t, t, Y)
+
+    Parameters
+    ----------
+    n_features:
+        Flow-state and target dimensionality. Image-only PileFlow uses 81.
+
+    context_dim:
+        Conditioning-vector dimensionality. Image-only PileFlow uses 243.
+
+    hidden_dim:
+        Width of the residual network.
+
+    n_blocks:
+        Number of residual blocks.
+
+    time_emb_dim:
+        Dimension of the sinusoidal time embedding.
+
+    dropout:
+        Dropout probability inside residual blocks.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        context_dim: int,
+        hidden_dim: int = 512,
+        n_blocks: int = 8,
+        time_emb_dim: int = 64,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        if n_features <= 0:
+            raise ValueError(f"n_features must be positive, got {n_features}")
+
+        if context_dim <= 0:
+            raise ValueError(f"context_dim must be positive, got {context_dim}")
+
+        self.n_features = n_features
         self.context_dim = context_dim
 
         self.time_emb = SinusoidalTimeEmb(time_emb_dim)
-        cond_dim      = time_emb_dim + context_dim
+        cond_dim = time_emb_dim + context_dim
 
         self.input_proj = nn.Linear(n_features, hidden_dim)
-        self.blocks     = nn.ModuleList([
-            ResBlock(hidden_dim, cond_dim, dropout) for _ in range(n_blocks)
-        ])
+
+        self.blocks = nn.ModuleList(
+            [
+                ResBlock(
+                    hidden_dim=hidden_dim,
+                    cond_dim=cond_dim,
+                    dropout=dropout,
+                )
+                for _ in range(n_blocks)
+            ]
+        )
+
         self.output_proj = nn.Linear(hidden_dim, n_features)
 
     def forward(
         self,
-        t:       torch.Tensor,   # (N,)   time in [0, 1]
-        z:       torch.Tensor,   # (N, n_features)
-        context: torch.Tensor,   # (N, context_dim)
+        t: torch.Tensor,
+        z: torch.Tensor,
+        context: torch.Tensor,
     ) -> torch.Tensor:
-        # Returns predicted velocity (N, n_features)
-        t_emb = self.time_emb(t)                    # (N, time_emb_dim)
-        cond  = torch.cat([t_emb, context], dim=-1) # (N, cond_dim)
-        h     = self.input_proj(z)
+        """
+        Predict the flow velocity.
+
+        Shapes
+        ------
+        t:
+            (N,)
+
+        z:
+            (N, n_features)
+
+        context:
+            (N, context_dim)
+
+        returns:
+            (N, n_features)
+        """
+        if z.ndim != 2 or z.shape[1] != self.n_features:
+            raise ValueError(
+                f"Expected z shape (N, {self.n_features}), got {tuple(z.shape)}"
+            )
+
+        if context.ndim != 2 or context.shape[1] != self.context_dim:
+            raise ValueError(
+                "Expected context shape "
+                f"(N, {self.context_dim}), got {tuple(context.shape)}"
+            )
+
+        if t.ndim != 1 or t.shape[0] != z.shape[0]:
+            raise ValueError(
+                f"Expected t shape ({z.shape[0]},), got {tuple(t.shape)}"
+            )
+
+        t_emb = self.time_emb(t)
+        cond = torch.cat([t_emb, context], dim=-1)
+
+        h = self.input_proj(z)
+
         for block in self.blocks:
             h = block(h, cond)
+
         return self.output_proj(h)
 
     def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        """Return the number of trainable model parameters."""
+        return sum(
+            parameter.numel()
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
 
 
+# ---------------------------------------------------------------------------
+# Flow-matching loss and ODE integration
+# ---------------------------------------------------------------------------
 
-# Flow matching loss + ODE integration
 class TargetCFM(nn.Module):
     """
-    Target Conditional Flow Matching (TCFM) — Lipman et al. / FlowSim.
+    Target Conditional Flow Matching.
 
     Interpolation path:
-        z_t = t * x1 + [1 - (1 - sigma_min) * t] * x0
-        u_t = x1 - (1 - sigma_min) * x0         (target velocity)
+
+        z_t = t*x1 + [1 - (1 - sigma_min)*t]*x0
+
+    Analytical target velocity:
+
+        u_t = x1 - (1 - sigma_min)*x0
     """
 
     def __init__(self, sigma_min: float = 1e-4):
         super().__init__()
+
+        if not 0.0 <= sigma_min < 1.0:
+            raise ValueError(
+                f"sigma_min must satisfy 0 <= sigma_min < 1, got {sigma_min}"
+            )
+
         self.sigma_min = sigma_min
 
-    def sample_training_pair(self, x1: torch.Tensor):
+    def sample_training_pair(
+        self,
+        x1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sample (t, z_t, u_t) for one training step.
+        Sample a flow-matching training tuple.
 
-        x1 : (N, D) standardised target samples
-        Returns t (N,), z_t (N,D), u_t (N,D)
+        Parameters
+        ----------
+        x1:
+            Standardized target image with shape (N, 81).
+
+        Returns
+        -------
+        t:
+            Integration times, shape (N,).
+
+        z_t:
+            Interpolated flow states, shape (N, 81).
+
+        u_t:
+            Target velocities, shape (N, 81).
         """
-        N, D = x1.shape
-        t    = torch.rand(N, device=x1.device)
-        x0   = torch.randn_like(x1)
-        z_t  = t[:, None] * x1 + (1 - (1 - self.sigma_min) * t[:, None]) * x0
-        u_t  = x1 - (1 - self.sigma_min) * x0
+        if x1.ndim != 2:
+            raise ValueError(
+                f"Expected x1 to have shape (N, D), got {tuple(x1.shape)}"
+            )
+
+        n = x1.shape[0]
+
+        t = torch.rand(
+            n,
+            device=x1.device,
+            dtype=x1.dtype,
+        )
+
+        x0 = torch.randn_like(x1)
+
+        scale = 1.0 - (1.0 - self.sigma_min) * t[:, None]
+
+        z_t = t[:, None] * x1 + scale * x0
+        u_t = x1 - (1.0 - self.sigma_min) * x0
+
         return t, z_t, u_t
 
     @torch.no_grad()
     def generate(
         self,
-        model:   CRTVelocityField,
+        model: CRTVelocityField,
         context: torch.Tensor,
         n_steps: int = 100,
-        device:  str = "cpu",
+        device: str | torch.device = "cpu",
     ) -> torch.Tensor:
-        """Euler integration z_0 ~ N(0,I) → z_1.  Returns (N, n_features)."""
+        """
+        Integrate the flow ODE using Euler steps.
+
+        Starts from:
+
+            z_0 ~ Normal(0, I)
+
+        and returns:
+
+            z_1 with shape (N, 81)
+        """
+        if n_steps <= 0:
+            raise ValueError(f"n_steps must be positive, got {n_steps}")
+
         model.eval()
-        N  = context.shape[0]
-        z  = torch.randn(N, model.n_features, device=device)
+
+        n = context.shape[0]
+
+        z = torch.randn(
+            n,
+            model.n_features,
+            device=device,
+            dtype=context.dtype,
+        )
+
         dt = 1.0 / n_steps
+
         for i in range(n_steps):
-            t_batch = torch.full((N,), i * dt, device=device)
+            t_batch = torch.full(
+                (n,),
+                i * dt,
+                device=device,
+                dtype=context.dtype,
+            )
+
             z = z + model(t_batch, z, context) * dt
+
         return z
 
 
+# ---------------------------------------------------------------------------
+# Image-only context encoder
+# ---------------------------------------------------------------------------
 
-# Context encoder  (assembles the 253-dim conditioning vector)
 class ContextEncoder(nn.Module):
     """
-    Assemble the 253-dim context vector Y for PileFlow.
+    Assemble the image-only 243-dimensional context vector.
 
     Inputs
     ------
-    scalar_gen     : (N, 7)   [pt_gen, eta, phi, m, muon_pT, jetR, jetArea]
-    flavour        : (N,) int  PDG code {1=light, 4=c, 5=b, 21=gluon}
-    ch_neutral_all : (N, 81)  total neutral pT @ 9×9, flattened
-    ch_charged_pu  : (N, 81)  charged pileup pT @ 9×9, flattened
-    ch_charged_lv  : (N, 81)  charged LV pT @ 9×9, flattened
+    ch_neutral_all:
+        Contaminated neutral image, shape (N, 81).
 
-    Output: (N, 253)
+    ch_charged_pu:
+        Charged pileup image, shape (N, 81).
 
-    Call .fit() on training data before training to set standardisation stats.
+    ch_charged_lv:
+        Charged leading-vertex image, shape (N, 81).
+
+    Output
+    ------
+    context:
+        Standardized and concatenated image context, shape (N, 243).
+
+    Call ``fit`` using training rows only before training.
     """
 
-    FLAVOUR_MAP = {
-        1: 0,
-        2: 0,
-        3: 0,
-        21: 0,
-        4: 1,
-        5: 2,
-    }   # PDG → class index
-
-    def __init__(
-        self,
-        scalar_dim:  int = N_GEN_SCALAR,
-        n_flavours:  int = N_FLAVOUR,
-        img_dim:     int = IMG_DIM,
-    ):
+    def __init__(self, img_dim: int = IMG_DIM):
         super().__init__()
-        self.scalar_dim = scalar_dim
-        self.n_flavours = n_flavours
-        self.img_dim    = img_dim
 
-        # Per-feature standardisation stats — fitted from training data
-        self.register_buffer("scalar_mean",      torch.zeros(scalar_dim))
-        self.register_buffer("scalar_std",       torch.ones(scalar_dim))
-        self.register_buffer("neutral_all_mean", torch.zeros(img_dim))
-        self.register_buffer("neutral_all_std",  torch.ones(img_dim))
-        self.register_buffer("charged_pu_mean",  torch.zeros(img_dim))
-        self.register_buffer("charged_pu_std",   torch.ones(img_dim))
-        self.register_buffer("charged_lv_mean",  torch.zeros(img_dim))
-        self.register_buffer("charged_lv_std",   torch.ones(img_dim))
+        self.img_dim = img_dim
+        self.context_dim = N_IMAGES * img_dim
 
+        self.register_buffer(
+            "neutral_all_mean",
+            torch.zeros(img_dim),
+        )
+        self.register_buffer(
+            "neutral_all_std",
+            torch.ones(img_dim),
+        )
+
+        self.register_buffer(
+            "charged_pu_mean",
+            torch.zeros(img_dim),
+        )
+        self.register_buffer(
+            "charged_pu_std",
+            torch.ones(img_dim),
+        )
+
+        self.register_buffer(
+            "charged_lv_mean",
+            torch.zeros(img_dim),
+        )
+        self.register_buffer(
+            "charged_lv_std",
+            torch.ones(img_dim),
+        )
+
+    def _validate_image(
+        self,
+        image: torch.Tensor,
+        name: str,
+    ) -> None:
+        if image.ndim != 2 or image.shape[1] != self.img_dim:
+            raise ValueError(
+                f"Expected {name} shape (N, {self.img_dim}), "
+                f"got {tuple(image.shape)}"
+            )
+
+    @staticmethod
+    def _stats(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mean = tensor.mean(dim=0)
+
+        std = tensor.std(
+            dim=0,
+            unbiased=False,
+        ).clamp(min=1e-6)
+
+        return mean, std
+
+    @torch.no_grad()
     def fit(
         self,
-        scalar_gen:     torch.Tensor,   # (N, 7)
-        ch_neutral_all: torch.Tensor,   # (N, 81)
-        ch_charged_pu:  torch.Tensor,   # (N, 81)
-        ch_charged_lv:  torch.Tensor,   # (N, 81)
-    ):
-        """Compute per-feature mean/std from training set only (no val leakage)."""
-        def _stats(t):
-            return t.mean(dim=0), t.std(dim=0, unbiased=False).clamp(min=1e-6)
+        ch_neutral_all: torch.Tensor,
+        ch_charged_pu: torch.Tensor,
+        ch_charged_lv: torch.Tensor,
+    ) -> None:
+        """
+        Fit per-pixel normalization statistics using training data only.
+        """
+        self._validate_image(ch_neutral_all, "ch_neutral_all")
+        self._validate_image(ch_charged_pu, "ch_charged_pu")
+        self._validate_image(ch_charged_lv, "ch_charged_lv")
 
-        self.scalar_mean,      self.scalar_std      = _stats(scalar_gen)
-        self.neutral_all_mean, self.neutral_all_std = _stats(ch_neutral_all)
-        self.charged_pu_mean,  self.charged_pu_std  = _stats(ch_charged_pu)
-        self.charged_lv_mean,  self.charged_lv_std  = _stats(ch_charged_lv)
+        if not (
+            ch_neutral_all.shape[0]
+            == ch_charged_pu.shape[0]
+            == ch_charged_lv.shape[0]
+        ):
+            raise ValueError("Context image channels have different row counts.")
+
+        (
+            self.neutral_all_mean,
+            self.neutral_all_std,
+        ) = self._stats(ch_neutral_all)
+
+        (
+            self.charged_pu_mean,
+            self.charged_pu_std,
+        ) = self._stats(ch_charged_pu)
+
+        (
+            self.charged_lv_mean,
+            self.charged_lv_std,
+        ) = self._stats(ch_charged_lv)
 
     def forward(
         self,
-        scalar_gen:     torch.Tensor,   # (N, 7)
-        flavour:        torch.Tensor,   # (N,) int PDG codes
-        ch_neutral_all: torch.Tensor,   # (N, 81)
-        ch_charged_pu:  torch.Tensor,   # (N, 81)
-        ch_charged_lv:  torch.Tensor,   # (N, 81)
+        ch_neutral_all: torch.Tensor,
+        ch_charged_pu: torch.Tensor,
+        ch_charged_lv: torch.Tensor,
     ) -> torch.Tensor:
-        """Returns (N, 253) context vector."""
-        # Standardise continuous scalars
-        s  = (scalar_gen     - self.scalar_mean)      / self.scalar_std
-        na = (ch_neutral_all - self.neutral_all_mean) / self.neutral_all_std
-        cp = (ch_charged_pu  - self.charged_pu_mean)  / self.charged_pu_std
-        cl = (ch_charged_lv  - self.charged_lv_mean)  / self.charged_lv_std
+        """
+        Return the standardized 243-dimensional context vector.
+        """
+        self._validate_image(ch_neutral_all, "ch_neutral_all")
+        self._validate_image(ch_charged_pu, "ch_charged_pu")
+        self._validate_image(ch_charged_lv, "ch_charged_lv")
 
-        # One-hot encode jet flavour → (N, 3)
-        flv_idx = torch.zeros_like(flavour, dtype=torch.long)
-        for pdg, idx in self.FLAVOUR_MAP.items():
-            flv_idx[flavour == pdg] = idx
-        flv_ohe = torch.zeros(flavour.shape[0], self.n_flavours,
-                              device=flavour.device, dtype=s.dtype)
-        flv_ohe.scatter_(1, flv_idx.unsqueeze(1), 1.0)
+        neutral_all_z = (
+            ch_neutral_all - self.neutral_all_mean
+        ) / self.neutral_all_std
 
-        return torch.cat([s, flv_ohe, na, cp, cl], dim=-1)   # (N, 253)
+        charged_pu_z = (
+            ch_charged_pu - self.charged_pu_mean
+        ) / self.charged_pu_std
+
+        charged_lv_z = (
+            ch_charged_lv - self.charged_lv_mean
+        ) / self.charged_lv_std
+
+        context = torch.cat(
+            [
+                neutral_all_z,
+                charged_pu_z,
+                charged_lv_z,
+            ],
+            dim=-1,
+        )
+
+        if context.shape[1] != self.context_dim:
+            raise RuntimeError(
+                f"Expected encoded context dimension {self.context_dim}, "
+                f"got {context.shape[1]}"
+            )
+
+        return context
 
 
+# ---------------------------------------------------------------------------
+# Image-only target preprocessor
+# ---------------------------------------------------------------------------
 
-# Target preprocessor  (standardise / unstandardise the 97-dim target)
 class TargetPreprocessor(nn.Module):
     """
-    Standardise the 97-dim target vector for flow-matching training.
+    Standardize and decode the 81-dimensional neutral-LV target image.
 
-    Target layout:
-      [0:81]   81-dim neutral LV pT image (9x9 flattened)
-      [81:97]  16-dim scalar observables
+    Target:
+        ch_neutral_lv, flattened from 9x9 to 81 pixels.
 
-    Call .fit() on training data first, then .encode() / .decode().
+    Call ``fit`` using training rows only before training.
+
+    Decoding always restores physical units and clamps negative transverse
+    momentum to zero. An optional pixel threshold may be supplied explicitly,
+    but no threshold is applied by default.
+
+    Final physics comparisons should normally decode without thresholding and
+    apply one common detector-cell threshold to every method inside the
+    comparison code.
     """
-    def __init__(self, n_img: int = IMG_DIM, n_scalars: int = N_SCALARS):
+
+    def __init__(
+        self,
+        n_img: int = IMG_DIM,
+    ):
         super().__init__()
-        self.n_img     = n_img
-        self.n_scalars = n_scalars
 
-        # Pixel-wise stats for the neutral LV image
-        self.register_buffer("img_mean",    torch.zeros(n_img))
-        self.register_buffer("img_std",     torch.ones(n_img))
-        # Feature-wise stats for scalar observables
-        self.register_buffer("scalar_mean", torch.zeros(n_scalars))
-        self.register_buffer("scalar_std",  torch.ones(n_scalars))
-        # Threshold below which pixels are zeroed at decode time
-        self.pt_threshold = 0.05   # GeV
+        if n_img <= 0:
+            raise ValueError(
+                f"n_img must be positive, got {n_img}"
+            )
 
+        self.n_img = n_img
+
+        self.register_buffer(
+            "img_mean",
+            torch.zeros(n_img),
+        )
+
+        self.register_buffer(
+            "img_std",
+            torch.ones(n_img),
+        )
+
+    def _validate_image(
+        self,
+        image: torch.Tensor,
+        name: str,
+    ) -> None:
+        if image.ndim != 2 or image.shape[1] != self.n_img:
+            raise ValueError(
+                f"Expected {name} shape "
+                f"(N, {self.n_img}), "
+                f"got {tuple(image.shape)}"
+            )
+
+    @torch.no_grad()
     def fit(
         self,
-        neutral_lv: torch.Tensor,   # (N, 81)
-        scalars:    torch.Tensor,   # (N, 16)
-    ):
-        """Compute standardisation stats from training data."""
-        def _stats(t):
-            return t.mean(dim=0), t.std(dim=0, unbiased=False).clamp(min=1e-6)
+        neutral_lv: torch.Tensor,
+    ) -> None:
+        """
+        Fit per-pixel target statistics using training rows only.
+        """
+        self._validate_image(
+            neutral_lv,
+            "neutral_lv",
+        )
 
-        self.img_mean,    self.img_std    = _stats(neutral_lv)
-        self.scalar_mean, self.scalar_std = _stats(scalars)
+        self.img_mean = neutral_lv.mean(
+            dim=0,
+        )
+
+        self.img_std = neutral_lv.std(
+            dim=0,
+            unbiased=False,
+        ).clamp(
+            min=1e-6,
+        )
 
     def encode(
         self,
-        neutral_lv: torch.Tensor,   # (N, 81)
-        scalars:    torch.Tensor,   # (N, 16)
+        neutral_lv: torch.Tensor,
     ) -> torch.Tensor:
-        #Returns (N, 97) standardised target
-        img_z    = (neutral_lv - self.img_mean)    / self.img_std
-        scalar_z = (scalars    - self.scalar_mean) / self.scalar_std
-        return torch.cat([img_z, scalar_z], dim=-1)
-
-    def decode(
-        self,
-        Z: torch.Tensor,   # (N, 97)  flow output in standardised space
-    ):
         """
-        Unstandardise flow output.
+        Standardize the target image.
+
+        Parameters
+        ----------
+        neutral_lv:
+            Physical neutral-LV pT image with shape (N, 81).
 
         Returns
         -------
-        img     : (N, 81) predicted neutral LV pT, clamped >= 0 with threshold
-        scalars : (N, 16) predicted scalar observables
+        torch.Tensor
+            Standardized target image with shape (N, 81).
         """
-        img_z    = Z[:, :self.n_img]
-        scalar_z = Z[:, self.n_img:]
+        self._validate_image(
+            neutral_lv,
+            "neutral_lv",
+        )
 
-        img     = img_z    * self.img_std    + self.img_mean
-        scalars = scalar_z * self.scalar_std + self.scalar_mean
+        return (
+            neutral_lv
+            - self.img_mean
+        ) / self.img_std
 
-        # Physical constraint: pT >= 0; zero out sub-threshold pixels
-        img = img.clamp(min=0.0)
-        img = img * (img >= self.pt_threshold).float()
+    def decode(
+        self,
+        z: torch.Tensor,
+        pt_threshold: float | None = None,
+    ) -> torch.Tensor:
+        """
+        Decode a generated standardized image.
 
-        return img, scalars
+        Parameters
+        ----------
+        z:
+            Flow output in standardized space with shape (N, 81).
+
+        pt_threshold:
+            Optional nonnegative pixel-pT threshold in GeV.
+
+            ``None`` or ``0.0``:
+                Return the raw nonnegative decoded image.
+
+            Positive value:
+                Set decoded pixels below this threshold to zero.
+
+            Final comparisons should normally use ``None`` and apply a common
+            threshold to True, pileup, PUPPI, PUMML, and PileFlow together.
+
+        Returns
+        -------
+        torch.Tensor
+            Predicted neutral-LV pT image with shape (N, 81).
+        """
+        self._validate_image(
+            z,
+            "flow output",
+        )
+
+        if (
+            pt_threshold is not None
+            and pt_threshold < 0.0
+        ):
+            raise ValueError(
+                "pt_threshold must be nonnegative or None, "
+                f"got {pt_threshold}"
+            )
+
+        image = (
+            z
+            * self.img_std
+            + self.img_mean
+        )
+
+        # Transverse momentum cannot be negative.
+        image = image.clamp(
+            min=0.0,
+        )
+
+        # Thresholding is optional and must be requested explicitly.
+        if (
+            pt_threshold is not None
+            and pt_threshold > 0.0
+        ):
+            image = torch.where(
+                image >= pt_threshold,
+                image,
+                torch.zeros_like(image),
+            )
+
+        return image
+
+__all__ = [
+    "IMG_DIM",
+    "N_IMAGES",
+    "N_SCALARS",
+    "N_TARGET",
+    "N_CONTEXT",
+    "SinusoidalTimeEmb",
+    "ResBlock",
+    "CRTVelocityField",
+    "TargetCFM",
+    "ContextEncoder",
+    "TargetPreprocessor",
+]

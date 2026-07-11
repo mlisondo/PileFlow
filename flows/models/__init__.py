@@ -1,12 +1,17 @@
+"""
+Public exports for the PileFlow model package.
+"""
+
 from .pileflow import (
     CRTVelocityField,
     TargetCFM,
     ContextEncoder,
     TargetPreprocessor,
+    IMG_DIM,
+    N_IMAGES,
+    N_SCALARS,
     N_TARGET,
     N_CONTEXT,
-    IMG_DIM,
-    N_SCALARS,
 )
 
 __all__ = [
@@ -14,8 +19,9 @@ __all__ = [
     "TargetCFM",
     "ContextEncoder",
     "TargetPreprocessor",
+    "IMG_DIM",
+    "N_IMAGES",
+    "N_SCALARS",
     "N_TARGET",
     "N_CONTEXT",
-    "IMG_DIM",
-    "N_SCALARS",
 ]

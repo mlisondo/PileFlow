@@ -92,7 +92,7 @@ class JetImageBuilder:
 
     def _fill_grid(
         self,
-        particles: list[TaggedParticle],
+        particles: list,
         jet_eta: float,
         jet_phi: float,
         edges: tuple[np.ndarray, np.ndarray],
@@ -104,8 +104,16 @@ class JetImageBuilder:
         grid = np.zeros((n_pixels, n_pixels), dtype=np.float32)
 
         for p in particles:
-            deta = p.eta - jet_eta
-            dphi = self._dphi(p.phi, jet_phi)
+            pt = float(p.pt)
+
+            if not np.isfinite(pt) or pt <= 0.0:
+                continue
+
+            deta = float(p.eta) - jet_eta
+            dphi = self._dphi(
+                float(p.phi),
+                jet_phi,
+            )
 
             if abs(deta) >= self.eta_range or abs(dphi) >= self.phi_range:
                 continue
@@ -116,7 +124,7 @@ class JetImageBuilder:
             ieta = int(np.clip(ieta, 0, n_pixels - 1))
             iphi = int(np.clip(iphi, 0, n_pixels - 1))
 
-            grid[ieta, iphi] += p.pt
+            grid[ieta, iphi] += pt
 
         return grid
 
@@ -185,6 +193,62 @@ class JetImageBuilder:
             "ch_neutral_lv": img_n_lv9,
         }
 
+    def build_reconstructed(
+        self,
+        jet_eta: float,
+        jet_phi: float,
+        particles: list,
+    ) -> dict[str, np.ndarray]:
+        """
+        Build detector-level charged and neutral images from a reconstructed
+        particle collection.
+
+        Unlike ``build``, this method does not use LV/PU truth labels. It is
+        intended for already-mitigated collections such as PUPPI output.
+
+        Charged particles above the tracking threshold are placed on the
+        36x36 charged grid. Neutral particles and charged particles at or below
+        the tracking threshold are placed on the 9x9 neutral grid.
+        """
+        charged: list = []
+        neutral: list = []
+
+        for particle in particles:
+            pt = float(particle.pt)
+
+            if not np.isfinite(pt) or pt <= 0.0:
+                continue
+
+            is_reco_charged = (
+                abs(float(particle.charge)) > 0.0
+                and pt > self.pt_charged_cut
+            )
+
+            if is_reco_charged:
+                charged.append(particle)
+            else:
+                neutral.append(particle)
+
+        charged_image = self._fill_grid(
+            charged,
+            jet_eta,
+            jet_phi,
+            self._edges_c,
+            self.n_pixels_charged,
+        )
+
+        neutral_image = self._fill_grid(
+            neutral,
+            jet_eta,
+            jet_phi,
+            self._edges_n,
+            self.n_pixels_neutral,
+        )
+
+        return {
+            "charged_36x36": charged_image,
+            "neutral_9x9": neutral_image,
+        }
 
 def _pack_constituents(pseudojets: list) -> dict[str, np.ndarray | np.int32]:
     """
@@ -420,6 +484,10 @@ def _initial_results() -> dict[str, list]:
         "ch_neutral_lv": [],
         "clean_neutral_lv": [],
         "clean_neutral_all": [],
+        "puppi_neutral_9x9": [],
+        "puppi_charged_36x36": [],
+        "event_id": [],
+        "jet_rank": [],
         "jet_pt": [],
         "jet_eta": [],
         "jet_phi": [],
@@ -477,6 +545,7 @@ def produce_images(
     jets: list,
     overlay: PileupOverlay,
     builder: JetImageBuilder,
+    event_id: int,
     n_pu: int = 140,
     jet_pt_min: float = 100.0,
     output_path: Optional[str] = None,
@@ -498,6 +567,8 @@ def produce_images(
         PileupOverlay instance.
     builder:
         JetImageBuilder instance.
+    event_id:
+        Stable identifier of the original generated event. Every saved jet from the same event receives the same value.
     n_pu:
         Actual number of pileup events to overlay.
     jet_pt_min:
@@ -521,6 +592,12 @@ def produce_images(
     else:
         clean_particles = _clean_particles_from_hard_event(hard_event)
         pu_particles = overlay.overlay(hard_event, n_pu=n_pu)
+
+    if not save_clean:
+        raise ValueError(
+            "The current NPZ schema requires clean reference images. "
+            "produce_images must be called with save_clean=True."
+        )
 
     # Save the full LV+PU particle collection before PUPPI.
     # This is duplicated for each saved jet from this event.
@@ -554,12 +631,19 @@ def produce_images(
 
     results = _initial_results()
 
-    for jet in jets:
-        if jet.pt() < jet_pt_min:
-            continue
+    selected_jets = [
+        jet
+        for jet in jets
+        if jet.pt() >= jet_pt_min
+        and abs(jet.eta()) < 2.5
+    ]
 
-        if abs(jet.eta()) >= 2.5:
-            continue
+    selected_jets = sorted(
+        selected_jets,
+        key=lambda jet: -float(jet.pt()),
+    )
+
+    for jet_rank, jet in enumerate(selected_jets):
 
         jet_eta = float(jet.eta())
         jet_phi = float(jet.phi())
@@ -573,11 +657,39 @@ def produce_images(
         results["ch_neutral_all_raw"].append(imgs_pu["ch_neutral_all_raw"])
         results["ch_neutral_lv"].append(imgs_pu["ch_neutral_lv"])
 
+
+        # Detector-level PUPPI images.
+        #
+        # PUPPI has already mitigated the particle collection. We therefore split
+        # its output only by reconstructed charge and the common tracking threshold,
+        # without using the LV/PU truth label.
+        imgs_puppi = builder.build_reconstructed(
+            jet_eta,
+            jet_phi,
+            puppi_output,
+        )
+
+        results["puppi_neutral_9x9"].append(
+            imgs_puppi["neutral_9x9"]
+        )
+
+        results["puppi_charged_36x36"].append(
+            imgs_puppi["charged_36x36"]
+        )
+
         # Clean LV-only reference images.
         if save_clean:
             imgs_clean = builder.build(jet_eta, jet_phi, clean_particles)
             results["clean_neutral_lv"].append(imgs_clean["ch_neutral_lv"])
             results["clean_neutral_all"].append(imgs_clean["ch_neutral_all_raw"])
+
+        results["event_id"].append(
+            np.int64(event_id)
+        )
+
+        results["jet_rank"].append(
+            np.int32(jet_rank)
+        )
 
         results["jet_pt"].append(float(jet.pt()))
         results["jet_eta"].append(jet_eta)
@@ -613,13 +725,48 @@ def produce_images(
         )
         _append_packed(results, "puppi", packed)
 
+    expected_rows = len(
+        results["jet_pt"]
+    )
+
+    row_counts = {
+        key: len(values)
+        for key, values in results.items()
+    }
+
+    misaligned = {
+        key: count
+        for key, count in row_counts.items()
+        if count != expected_rows
+    }
+
+    if misaligned:
+        raise RuntimeError(
+            "Image output arrays are not row-aligned. "
+            f"Expected {expected_rows} rows for every key, "
+            f"but found: {misaligned}"
+        )
+
     if not results["jet_pt"]:
         final = empty_image_arrays(
             n_charged=builder.n_pixels_charged,
             n_neutral=builder.n_pixels_neutral,
         )
     else:
-        final = {key: np.array(value) for key, value in results.items()}
+        final = {
+            key: np.asarray(value)
+            for key, value in results.items()
+        }
+
+        final["event_id"] = final["event_id"].astype(
+            np.int64,
+            copy=False,
+        )
+
+        final["jet_rank"] = final["jet_rank"].astype(
+            np.int32,
+            copy=False,
+        )
 
     if output_path is not None:
         np.savez_compressed(output_path, **final)
@@ -628,13 +775,20 @@ def produce_images(
 
         print(
             f"[pumml_jet_images] Saved {n_jets} jets -> {output_path}\n"
-            f"  ch_neutral_all   : {final['ch_neutral_all'].shape} (contaminated)\n"
-            f"  ch_neutral_lv    : {final['ch_neutral_lv'].shape} (PUMML target)\n"
-            f"  clean_neutral_all: {final['clean_neutral_all'].shape} (True curve)\n"
-            f"  full particles   : {final['full_px'].shape}\n"
-            f"  true consts      : {final['true_px'].shape}\n"
-            f"  pileup consts    : {final['pileup_px'].shape}\n"
-            f"  puppi consts     : {final['puppi_px'].shape}"
+            f"  ch_neutral_all      : {final['ch_neutral_all'].shape} "
+            "(contaminated)\n"
+            f"  ch_neutral_lv       : {final['ch_neutral_lv'].shape} "
+            "(PUMML target)\n"
+            f"  clean_neutral_all   : {final['clean_neutral_all'].shape} "
+            "(True curve)\n"
+            f"  PUPPI neutral image : {final['puppi_neutral_9x9'].shape}\n"
+            f"  PUPPI charged image : {final['puppi_charged_36x36'].shape}\n"
+            f"  event IDs           : {final['event_id'].shape}\n"
+            f"  jet ranks           : {final['jet_rank'].shape}\n"
+            f"  full particles      : {final['full_px'].shape}\n"
+            f"  true consts         : {final['true_px'].shape}\n"
+            f"  pileup consts       : {final['pileup_px'].shape}\n"
+            f"  puppi consts        : {final['puppi_px'].shape}"
         )
 
     return final

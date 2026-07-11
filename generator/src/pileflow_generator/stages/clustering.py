@@ -7,10 +7,12 @@ This module owns:
     - jet pT/eta cuts,
     - constituent lookup,
     - feature-row construction,
-    - PUMML/PUPPI image accumulation hook.
+    - PUMML/PUPPI image accumulation,
+    - event-ID and within-event jet-rank propagation.
 
 Feature definitions live in ``stages.features``.
 Parton matching lives in ``physics.matching``.
+The image-array contract lives in ``schemas.image_arrays``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,10 @@ import fastjet as fj
 
 from pileflow_generator.physics.matching import match_flavour
 from pileflow_generator.schemas.jet_features import N_FEATURES
+from pileflow_generator.schemas.image_arrays import (
+    REQUIRED_NPZ_KEYS,
+    empty_image_arrays,
+)
 from pileflow_generator.stages.features import (
     build_feature_row,
     compute_fractions,
@@ -29,55 +35,11 @@ from pileflow_generator.stages.features import (
 from pileflow_generator.stages.images import produce_images
 
 
-IMAGE_ACCUMULATION_KEYS = [
-    # PUMML inputs.
-    "ch_charged_lv",
-    "ch_charged_pu",
-    "ch_neutral_all",
-    "ch_neutral_all_raw",
-    "ch_neutral_lv",
-
-    # Clean reference.
-    "clean_neutral_lv",
-    "clean_neutral_all",
-
-    # Metadata.
-    "jet_pt",
-    "jet_eta",
-    "jet_phi",
-    "n_pu",
-
-    # Full LV + PU particles before PUPPI.
-    # These are needed to rerun PUPPI standalone after generation.
-    "full_px",
-    "full_py",
-    "full_pz",
-    "full_e",
-    "full_charge",
-    "full_is_lv",
-    "full_n",
-
-    # True LV-only constituents.
-    "true_px",
-    "true_py",
-    "true_pz",
-    "true_e",
-    "true_n",
-
-    # LV + pileup constituents.
-    "pileup_px",
-    "pileup_py",
-    "pileup_pz",
-    "pileup_e",
-    "pileup_n",
-
-    # PUPPI-mitigated constituents.
-    "puppi_px",
-    "puppi_py",
-    "puppi_pz",
-    "puppi_e",
-    "puppi_n",
-]
+# Use the formal NPZ schema as the single source of truth.
+#
+# This prevents the accumulation list from drifting out of sync with
+# schemas/image_arrays.py when new arrays are added.
+IMAGE_ACCUMULATION_KEYS = list(REQUIRED_NPZ_KEYS)
 
 
 class FastJetRunner:
@@ -107,7 +69,7 @@ class FastJetRunner:
         Mean pileup count used for image production.
 
     image_pt_min:
-        Independent jet pT cut for the PUMML image dataset.
+        Independent jet pT cut for the PUMML/PUPPI image dataset.
 
     image_output_path:
         Path where the accumulated ``.npz`` image file is saved.
@@ -135,14 +97,18 @@ class FastJetRunner:
         self.image_output_path = image_output_path
 
         self._image_accum: dict[str, list[np.ndarray]] = {
-            key: [] for key in IMAGE_ACCUMULATION_KEYS
+            key: []
+            for key in IMAGE_ACCUMULATION_KEYS
         }
 
     def _make_jet_definition(self):
         """
         Create the anti-kT FastJet definition.
         """
-        return fj.JetDefinition(fj.antikt_algorithm, self.jet_R)
+        return fj.JetDefinition(
+            fj.antikt_algorithm,
+            self.jet_R,
+        )
 
     def _make_area_definition(self):
         """
@@ -155,21 +121,38 @@ class FastJetRunner:
         """
         try:
             ghost_spec = fj.GhostedAreaSpec(5.0)
-            area_def = fj.AreaDefinition(fj.active_area, ghost_spec)
+            area_def = fj.AreaDefinition(
+                fj.active_area,
+                ghost_spec,
+            )
             return True, area_def
+
         except Exception:
-            print("Warning: FastJet area support is not available. jetArea will be set to 0.")
+            print(
+                "Warning: FastJet area support is not available. "
+                "jetArea will be set to 0."
+            )
             return False, None
 
     @staticmethod
-    def _sorted_inclusive_jets(cluster_sequence) -> list:
+    def _sorted_inclusive_jets(
+        cluster_sequence,
+    ) -> list:
         """
         Return inclusive jets sorted by descending pT.
         """
         try:
-            return list(fj.sorted_by_pt(cluster_sequence.inclusive_jets()))
+            return list(
+                fj.sorted_by_pt(
+                    cluster_sequence.inclusive_jets()
+                )
+            )
+
         except Exception:
-            return sorted(cluster_sequence.inclusive_jets(), key=lambda j: -j.pt())
+            return sorted(
+                cluster_sequence.inclusive_jets(),
+                key=lambda jet: -jet.pt(),
+            )
 
     def _cluster_event(
         self,
@@ -182,26 +165,41 @@ class FastJetRunner:
         Cluster one event with or without active-area support.
         """
         if area_supported:
-            return fj.ClusterSequenceArea(pseudojets, jet_def, area_def)
+            return fj.ClusterSequenceArea(
+                pseudojets,
+                jet_def,
+                area_def,
+            )
 
-        return fj.ClusterSequence(pseudojets, jet_def)
+        return fj.ClusterSequence(
+            pseudojets,
+            jet_def,
+        )
 
-    def _select_jets(self, jets_all: list) -> list:
+    def _select_jets(
+        self,
+        jets_all: list,
+    ) -> list:
         """
-        Apply the old jet selection.
+        Select jets for the legacy 25-feature NPY dataset.
 
-        The eta cut preserves the old tracker-acceptance-inspired behavior:
-            pT >= jet_pt_min and |eta| < 2.5
+        The image dataset has its own independent pT cut, applied later
+        inside ``produce_images``.
         """
         return [
-            jet for jet in jets_all
-            if jet.pt() >= self.jet_pt_min and abs(jet.eta()) < 2.5
+            jet
+            for jet in jets_all
+            if jet.pt() >= self.jet_pt_min
+            and abs(jet.eta()) < 2.5
         ]
 
     @staticmethod
-    def _constituent_info(jet, particle_map: dict) -> list[tuple]:
+    def _constituent_info(
+        jet,
+        particle_map: dict,
+    ) -> list[tuple]:
         """
-        Recover ``(constituent, pid, is_charged)`` for real jet constituents.
+        Recover ``(constituent, pid, is_charged)`` for real constituents.
 
         FastJet ghost particles may have missing or invalid user indices.
         Those are skipped.
@@ -209,27 +207,38 @@ class FastJetRunner:
         const_info = []
 
         for constituent in jet.constituents():
-            idx = constituent.user_index()
-            info = particle_map.get(idx)
+            index = constituent.user_index()
+            info = particle_map.get(index)
 
             if info is None:
                 continue
 
             pid, is_charged = info
-            const_info.append((constituent, pid, is_charged))
+
+            const_info.append(
+                (
+                    constituent,
+                    pid,
+                    is_charged,
+                )
+            )
 
         return const_info
 
     @staticmethod
-    def _jet_area(jet, area_supported: bool) -> float:
+    def _jet_area(
+        jet,
+        area_supported: bool,
+    ) -> float:
         """
-        Read active jet area, returning 0 if unavailable.
+        Read active jet area, returning zero if unavailable.
         """
         if not area_supported:
             return 0.0
 
         try:
             return float(jet.area())
+
         except Exception:
             return 0.0
 
@@ -237,67 +246,261 @@ class FastJetRunner:
         """
         Check whether image production is enabled.
         """
-        return self.pileup_overlay is not None and self.image_builder is not None
+        return (
+            self.pileup_overlay is not None
+            and self.image_builder is not None
+        )
 
-    def _accumulate_event_images(self, event_data: dict, jets: list) -> None:
+    def _accumulate_event_images(
+        self,
+        event_data: dict,
+        jets_all: list,
+    ) -> None:
         """
-        Run image production for one event and append arrays to the accumulator.
+        Build image-level rows for one event and append them to the run-level
+        accumulator.
+
+        ``jets_all`` is passed rather than the feature-selected jets so that
+        ``image_pt_min`` remains independent from ``jet_pt_min``.
         """
         if not self._image_production_enabled():
             return
 
-        n_pu = int(self.rng.poisson(lam=self.n_pu))
+        n_pu = int(
+            self.rng.poisson(
+                lam=self.n_pu,
+            )
+        )
 
         event_imgs = produce_images(
             hard_event=event_data["lv_snapshot"],
-            jets=jets,
+            jets=jets_all,
             overlay=self.pileup_overlay,
             builder=self.image_builder,
+            event_id=int(
+                event_data["source_event_idx"]
+            ),
             n_pu=n_pu,
             jet_pt_min=self.image_pt_min,
             output_path=None,
         )
 
-        for key in self._image_accum:
-            arr = event_imgs[key]
+        missing_keys = [
+            key
+            for key in IMAGE_ACCUMULATION_KEYS
+            if key not in event_imgs
+        ]
 
-            if len(arr):
-                self._image_accum[key].append(arr)
+        unexpected_keys = [
+            key
+            for key in event_imgs
+            if key not in IMAGE_ACCUMULATION_KEYS
+        ]
+
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "Per-event image payload does not match the NPZ schema. "
+                f"Missing keys: {missing_keys}; "
+                f"unexpected keys: {unexpected_keys}"
+            )
+
+        row_counts = {
+            key: len(event_imgs[key])
+            for key in IMAGE_ACCUMULATION_KEYS
+        }
+
+        unique_row_counts = set(
+            row_counts.values()
+        )
+
+        if len(unique_row_counts) != 1:
+            raise RuntimeError(
+                "Per-event image payload is not row-aligned: "
+                f"{row_counts}"
+            )
+
+        n_event_jets = next(
+            iter(unique_row_counts),
+            0,
+        )
+
+        if n_event_jets == 0:
+            return
+
+        for key in IMAGE_ACCUMULATION_KEYS:
+            self._image_accum[key].append(
+                event_imgs[key]
+            )
 
     def _save_accumulated_images(self) -> None:
         """
-        Save accumulated PUMML/PUPPI image arrays to ``image_output_path``.
+        Save the complete detector-image NPZ payload.
+
+        Every required key must exist and every array must have the same
+        leading dimension.
         """
         if not self._image_production_enabled():
             return
 
-        if not any(self._image_accum.values()):
-            return
-
         if self.image_output_path is None:
             raise ValueError(
-                "Image production was enabled, but image_output_path is None."
+                "Image production was enabled, but "
+                "image_output_path is None."
             )
 
-        final = {
-            key: np.concatenate(value, axis=0)
-            for key, value in self._image_accum.items()
-            if value
-        }
+        populated_keys = [
+            key
+            for key, chunks in self._image_accum.items()
+            if chunks
+        ]
 
-        np.savez_compressed(self.image_output_path, **final)
+        if not populated_keys:
+            final = empty_image_arrays(
+                n_charged=(
+                    self.image_builder.n_pixels_charged
+                ),
+                n_neutral=(
+                    self.image_builder.n_pixels_neutral
+                ),
+            )
 
-        n_jets = len(final.get("jet_pt", []))
+        else:
+            missing_accumulators = [
+                key
+                for key in IMAGE_ACCUMULATION_KEYS
+                if not self._image_accum[key]
+            ]
 
-        print(
-            f"[PUMML] Saved {n_jets} jets -> {self.image_output_path}\n"
-            f"  images       : ch_neutral_all {final['ch_neutral_all'].shape}\n"
-            f"  true consts  : {final['true_px'].shape}\n"
-            f"  pileup consts: {final['pileup_px'].shape}\n"
-            f"  puppi consts : {final['puppi_px'].shape}"
+            if missing_accumulators:
+                raise RuntimeError(
+                    "Cannot save an incomplete NPZ payload. "
+                    "These required accumulators are empty: "
+                    f"{missing_accumulators}"
+                )
+
+            final = {
+                key: np.concatenate(
+                    self._image_accum[key],
+                    axis=0,
+                )
+                for key in IMAGE_ACCUMULATION_KEYS
+            }
+
+        missing_final_keys = [
+            key
+            for key in IMAGE_ACCUMULATION_KEYS
+            if key not in final
+        ]
+
+        unexpected_final_keys = [
+            key
+            for key in final
+            if key not in IMAGE_ACCUMULATION_KEYS
+        ]
+
+        if missing_final_keys or unexpected_final_keys:
+            raise RuntimeError(
+                "Final image payload does not match the NPZ schema. "
+                f"Missing keys: {missing_final_keys}; "
+                f"unexpected keys: {unexpected_final_keys}"
+            )
+
+        final["event_id"] = np.asarray(
+            final["event_id"],
+            dtype=np.int64,
         )
 
-    def cluster_events(self, stored_events: list[dict]) -> tuple[np.ndarray, list]:
+        final["jet_rank"] = np.asarray(
+            final["jet_rank"],
+            dtype=np.int32,
+        )
+
+        row_counts = {
+            key: len(value)
+            for key, value in final.items()
+        }
+
+        unique_row_counts = set(
+            row_counts.values()
+        )
+
+        if len(unique_row_counts) != 1:
+            raise RuntimeError(
+                "Accumulated NPZ arrays are not row-aligned: "
+                f"{row_counts}"
+            )
+
+        n_jets = next(
+            iter(unique_row_counts),
+            0,
+        )
+
+        # Verify that each event has at most one row for each jet rank.
+        if n_jets:
+            event_rank_pairs = np.stack(
+                [
+                    final["event_id"],
+                    final["jet_rank"].astype(
+                        np.int64,
+                        copy=False,
+                    ),
+                ],
+                axis=1,
+            )
+
+            unique_pairs = np.unique(
+                event_rank_pairs,
+                axis=0,
+            )
+
+            if len(unique_pairs) != n_jets:
+                raise RuntimeError(
+                    "Duplicate (event_id, jet_rank) pairs were found "
+                    "in the accumulated image dataset."
+                )
+
+        np.savez_compressed(
+            self.image_output_path,
+            **final,
+        )
+
+        n_events = (
+            len(
+                np.unique(
+                    final["event_id"]
+                )
+            )
+            if n_jets
+            else 0
+        )
+
+        print(
+            f"[PUMML] Saved {n_jets} jets from {n_events} events "
+            f"-> {self.image_output_path}\n"
+            f"  neutral input      : "
+            f"{final['ch_neutral_all'].shape}\n"
+            f"  neutral target     : "
+            f"{final['ch_neutral_lv'].shape}\n"
+            f"  PUPPI neutral      : "
+            f"{final['puppi_neutral_9x9'].shape}\n"
+            f"  PUPPI charged      : "
+            f"{final['puppi_charged_36x36'].shape}\n"
+            f"  event IDs          : "
+            f"{final['event_id'].shape}\n"
+            f"  jet ranks          : "
+            f"{final['jet_rank'].shape}\n"
+            f"  true constituents  : "
+            f"{final['true_px'].shape}\n"
+            f"  pileup constituents: "
+            f"{final['pileup_px'].shape}\n"
+            f"  PUPPI constituents : "
+            f"{final['puppi_px'].shape}"
+        )
+
+    def cluster_events(
+        self,
+        stored_events: list[dict],
+    ) -> tuple[np.ndarray, list]:
         """
         Cluster stored Pythia events and build the final jet dataset.
 
@@ -317,14 +520,20 @@ class FastJetRunner:
         event_figures: list[dict] = []
 
         jet_def = self._make_jet_definition()
-        area_supported, area_def = self._make_area_definition()
+        area_supported, area_def = (
+            self._make_area_definition()
+        )
 
         for event_data in stored_events:
             particles = event_data["particles"]
             particle_map = event_data["particle_map"]
             partons = event_data["partons"]
 
-            pseudojets = [pj for pj, _pid, _is_charged in particles]
+            pseudojets = [
+                pseudojet
+                for pseudojet, _pid, _is_charged
+                in particles
+            ]
 
             if not pseudojets:
                 continue
@@ -336,32 +545,60 @@ class FastJetRunner:
                 area_def=area_def,
             )
 
-            jets_all = self._sorted_inclusive_jets(cluster_sequence)
-            jets = self._select_jets(jets_all)
+            jets_all = self._sorted_inclusive_jets(
+                cluster_sequence
+            )
+
+            # Image production has an independent pT selection.
+            #
+            # This must occur before the legacy feature-dataset ``continue``
+            # so events with no feature-level jets can still contribute image
+            # jets if they pass ``image_pt_min``.
+            self._accumulate_event_images(
+                event_data,
+                jets_all,
+            )
+
+            jets = self._select_jets(
+                jets_all
+            )
 
             if not jets:
                 continue
 
             jets_eta_phi_pt = [
-                (float(j.eta()), float(j.phi()), float(j.pt()))
-                for j in jets
+                (
+                    float(jet.eta()),
+                    float(jet.phi()),
+                    float(jet.pt()),
+                )
+                for jet in jets
             ]
 
             event_figures.append(
                 {
-                    "source_event_idx": int(event_data["source_event_idx"]),
-                    "accepted_event_idx": int(event_data["accepted_event_idx"]),
+                    "source_event_idx": int(
+                        event_data["source_event_idx"]
+                    ),
+                    "accepted_event_idx": int(
+                        event_data["accepted_event_idx"]
+                    ),
                     "jets_eta_phi_pt": jets_eta_phi_pt,
                 }
             )
 
             for jet in jets:
-                const_info = self._constituent_info(jet, particle_map)
+                const_info = self._constituent_info(
+                    jet,
+                    particle_map,
+                )
 
                 if not const_info:
                     continue
 
-                fracs = compute_fractions(const_info)
+                fractions = compute_fractions(
+                    const_info
+                )
 
                 flavour = match_flavour(
                     jet_eta=jet.eta(),
@@ -370,25 +607,35 @@ class FastJetRunner:
                     R=self.jet_R,
                 )
 
-                jet_area = self._jet_area(jet, area_supported)
+                jet_area = self._jet_area(
+                    jet,
+                    area_supported,
+                )
 
                 feature_row = build_feature_row(
                     rng=self.rng,
                     jet=jet,
-                    fracs=fracs,
+                    fracs=fractions,
                     flavour=flavour,
                     jet_R=self.jet_R,
                     jet_area=jet_area,
                 )
 
-                dataset_rows.append(feature_row)
-
-            self._accumulate_event_images(event_data, jets)
+                dataset_rows.append(
+                    feature_row
+                )
 
         if dataset_rows:
-            dataset = np.asarray(dataset_rows, dtype=np.float32)
+            dataset = np.asarray(
+                dataset_rows,
+                dtype=np.float32,
+            )
+
         else:
-            dataset = np.empty((0, N_FEATURES), dtype=np.float32)
+            dataset = np.empty(
+                (0, N_FEATURES),
+                dtype=np.float32,
+            )
 
         self._save_accumulated_images()
 

@@ -7,6 +7,8 @@ The `.npz` file contains:
     - PUMML input images
     - PUMML target images
     - clean no-pileup reference images
+    - detector-level PUPPI neutral and charged images
+    - event identifiers and per-event jet ranks
     - true / pileup / PUPPI constituent arrays
 
 Do not change these keys casually. Downstream diagnostics, PUMML training,
@@ -42,7 +44,7 @@ PHI_RANGE = 0.45
 PT_CHARGED_CUT = 0.5
 
 
-# PUMML image keys.
+# Detector-image keys.
 IMAGE_KEYS = [
     "ch_charged_lv",
     "ch_charged_pu",
@@ -51,11 +53,14 @@ IMAGE_KEYS = [
     "ch_neutral_lv",
     "clean_neutral_lv",
     "clean_neutral_all",
+    "puppi_neutral_9x9",
+    "puppi_charged_36x36",
 ]
-
 
 # Per-jet metadata keys stored in the `.npz`.
 JET_METADATA_KEYS = [
+    "event_id",
+    "jet_rank",
     "jet_pt",
     "jet_eta",
     "jet_phi",
@@ -110,13 +115,51 @@ REQUIRED_NPZ_KEYS = (
 
 
 IMAGE_SHAPES = {
-    "ch_charged_lv": ("N", N_PIXELS_CHARGED, N_PIXELS_CHARGED),
-    "ch_charged_pu": ("N", N_PIXELS_CHARGED, N_PIXELS_CHARGED),
-    "ch_neutral_all": ("N", N_PIXELS_CHARGED, N_PIXELS_CHARGED),
-    "ch_neutral_all_raw": ("N", N_PIXELS_NEUTRAL, N_PIXELS_NEUTRAL),
-    "ch_neutral_lv": ("N", N_PIXELS_NEUTRAL, N_PIXELS_NEUTRAL),
-    "clean_neutral_lv": ("N", N_PIXELS_NEUTRAL, N_PIXELS_NEUTRAL),
-    "clean_neutral_all": ("N", N_PIXELS_NEUTRAL, N_PIXELS_NEUTRAL),
+    "ch_charged_lv": (
+        "N",
+        N_PIXELS_CHARGED,
+        N_PIXELS_CHARGED,
+    ),
+    "ch_charged_pu": (
+        "N",
+        N_PIXELS_CHARGED,
+        N_PIXELS_CHARGED,
+    ),
+    "ch_neutral_all": (
+        "N",
+        N_PIXELS_CHARGED,
+        N_PIXELS_CHARGED,
+    ),
+    "ch_neutral_all_raw": (
+        "N",
+        N_PIXELS_NEUTRAL,
+        N_PIXELS_NEUTRAL,
+    ),
+    "ch_neutral_lv": (
+        "N",
+        N_PIXELS_NEUTRAL,
+        N_PIXELS_NEUTRAL,
+    ),
+    "clean_neutral_lv": (
+        "N",
+        N_PIXELS_NEUTRAL,
+        N_PIXELS_NEUTRAL,
+    ),
+    "clean_neutral_all": (
+        "N",
+        N_PIXELS_NEUTRAL,
+        N_PIXELS_NEUTRAL,
+    ),
+    "puppi_neutral_9x9": (
+        "N",
+        N_PIXELS_NEUTRAL,
+        N_PIXELS_NEUTRAL,
+    ),
+    "puppi_charged_36x36": (
+        "N",
+        N_PIXELS_CHARGED,
+        N_PIXELS_CHARGED,
+    ),
 }
 
 
@@ -161,8 +204,30 @@ def empty_image_arrays(n_charged: int = N_PIXELS_CHARGED, n_neutral: int = N_PIX
         "ch_neutral_all_raw": np.empty((0, n_neutral, n_neutral), dtype=np.float32),
         "ch_neutral_lv": np.empty((0, n_neutral, n_neutral), dtype=np.float32),
         "clean_neutral_lv": np.empty((0, n_neutral, n_neutral), dtype=np.float32),
-        "clean_neutral_all": np.empty((0, n_neutral, n_neutral), dtype=np.float32),
-        "jet_pt": np.empty(0, dtype=np.float32),
+        "clean_neutral_all": np.empty(
+            (0, n_neutral, n_neutral),
+            dtype=np.float32,
+        ),
+        "puppi_neutral_9x9": np.empty(
+            (0, n_neutral, n_neutral),
+            dtype=np.float32,
+        ),
+        "puppi_charged_36x36": np.empty(
+            (0, n_charged, n_charged),
+            dtype=np.float32,
+        ),
+        "event_id": np.empty(
+            0,
+            dtype=np.int64,
+        ),
+        "jet_rank": np.empty(
+            0,
+            dtype=np.int32,
+        ),
+        "jet_pt": np.empty(
+            0,
+            dtype=np.float32,
+        ),
         "jet_eta": np.empty(0, dtype=np.float32),
         "jet_phi": np.empty(0, dtype=np.float32),
         "n_pu": np.empty(0, dtype=np.int32),
