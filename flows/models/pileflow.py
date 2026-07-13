@@ -6,23 +6,24 @@ PileFlow: pileup mitigation using Target Conditional Flow Matching.
 
 The image-only model is conditioned exclusively on three jet-image channels:
 
-    1. ch_neutral_all_raw  : contaminated neutral pT image
-    2. ch_charged_pu       : charged pileup pT image
-    3. ch_charged_lv       : charged leading-vertex pT image
+    1. ch_neutral_all_raw : contaminated neutral pT image, 9x9
+    2. ch_charged_pu      : charged pileup pT image, 36x36
+    3. ch_charged_lv      : charged leading-vertex pT image, 36x36
 
-All three channels are represented internally as flattened 9x9 images.
+The neutral image is flattened from 9x9 to 81 pixels.
+Each charged image is flattened directly from 36x36 to 1296 pixels.
 
 Context vector Y:
-    [0:81]    ch_neutral_all_raw
-    [81:162]  ch_charged_pu
-    [162:243] ch_charged_lv
+    [0:81]       ch_neutral_all_raw
+    [81:1377]    ch_charged_pu
+    [1377:2673]  ch_charged_lv
 
 Target vector X:
-    [0:81]    ch_neutral_lv
+    [0:81]       ch_neutral_lv
 
 The flow therefore learns:
 
-    v_theta(z_t, t, Y): R^81 x R x R^243 -> R^81
+    v_theta(z_t, t, Y): R^81 x R x R^2673 -> R^81
 
 References:
     Vaselli et al. arXiv:2402.13684v2
@@ -38,17 +39,20 @@ import torch
 import torch.nn as nn
 
 
-# Image-only dimensionalities
-IMG_DIM = 81
+# Mixed-resolution image dimensionalities
+NEUTRAL_SIDE = 9
+CHARGED_SIDE = 36
+NEUTRAL_DIM = NEUTRAL_SIDE * NEUTRAL_SIDE
+CHARGED_DIM = CHARGED_SIDE * CHARGED_SIDE
+
+# Backward-compatible alias for code that uses IMG_DIM as the target dimension.
+IMG_DIM = NEUTRAL_DIM
+
 N_IMAGES = 3
 N_SCALARS = 0
-N_TARGET = IMG_DIM
-N_CONTEXT = N_IMAGES * IMG_DIM
+N_TARGET = NEUTRAL_DIM
+N_CONTEXT = NEUTRAL_DIM + 2 * CHARGED_DIM
 
-
-# ---------------------------------------------------------------------------
-# Velocity-field components
-# ---------------------------------------------------------------------------
 
 class SinusoidalTimeEmb(nn.Module):
     """Fixed sinusoidal time embedding, as used in DDPM and FlowSim."""
@@ -110,7 +114,6 @@ class ResBlock(nn.Module):
         residual = self.act(residual)
         residual = self.fc2(residual)
         residual = self.dropout(residual)
-
         return self.norm(h + residual)
 
 
@@ -123,10 +126,11 @@ class CRTVelocityField(nn.Module):
     Parameters
     ----------
     n_features:
-        Flow-state and target dimensionality. Image-only PileFlow uses 81.
+        Flow-state and target dimensionality. PileFlow uses 81.
 
     context_dim:
-        Conditioning-vector dimensionality. Image-only PileFlow uses 243.
+        Conditioning-vector dimensionality. Mixed-resolution PileFlow uses
+        2673: 81 neutral pixels and two sets of 1296 charged pixels.
 
     hidden_dim:
         Width of the residual network.
@@ -157,6 +161,12 @@ class CRTVelocityField(nn.Module):
 
         if context_dim <= 0:
             raise ValueError(f"context_dim must be positive, got {context_dim}")
+
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+
+        if n_blocks <= 0:
+            raise ValueError(f"n_blocks must be positive, got {n_blocks}")
 
         self.n_features = n_features
         self.context_dim = context_dim
@@ -209,8 +219,14 @@ class CRTVelocityField(nn.Module):
 
         if context.ndim != 2 or context.shape[1] != self.context_dim:
             raise ValueError(
-                "Expected context shape "
-                f"(N, {self.context_dim}), got {tuple(context.shape)}"
+                f"Expected context shape (N, {self.context_dim}), "
+                f"got {tuple(context.shape)}"
+            )
+
+        if context.shape[0] != z.shape[0]:
+            raise ValueError(
+                "Flow state and context have different batch sizes: "
+                f"{z.shape[0]} and {context.shape[0]}"
             )
 
         if t.ndim != 1 or t.shape[0] != z.shape[0]:
@@ -220,7 +236,6 @@ class CRTVelocityField(nn.Module):
 
         t_emb = self.time_emb(t)
         cond = torch.cat([t_emb, context], dim=-1)
-
         h = self.input_proj(z)
 
         for block in self.blocks:
@@ -236,10 +251,6 @@ class CRTVelocityField(nn.Module):
             if parameter.requires_grad
         )
 
-
-# ---------------------------------------------------------------------------
-# Flow-matching loss and ODE integration
-# ---------------------------------------------------------------------------
 
 class TargetCFM(nn.Module):
     """
@@ -293,20 +304,11 @@ class TargetCFM(nn.Module):
             )
 
         n = x1.shape[0]
-
-        t = torch.rand(
-            n,
-            device=x1.device,
-            dtype=x1.dtype,
-        )
-
+        t = torch.rand(n, device=x1.device, dtype=x1.dtype)
         x0 = torch.randn_like(x1)
-
         scale = 1.0 - (1.0 - self.sigma_min) * t[:, None]
-
         z_t = t[:, None] * x1 + scale * x0
         u_t = x1 - (1.0 - self.sigma_min) * x0
-
         return t, z_t, u_t
 
     @torch.no_grad()
@@ -331,8 +333,13 @@ class TargetCFM(nn.Module):
         if n_steps <= 0:
             raise ValueError(f"n_steps must be positive, got {n_steps}")
 
-        model.eval()
+        if context.ndim != 2 or context.shape[1] != model.context_dim:
+            raise ValueError(
+                f"Expected context shape (N, {model.context_dim}), "
+                f"got {tuple(context.shape)}"
+            )
 
+        model.eval()
         n = context.shape[0]
 
         z = torch.randn(
@@ -351,19 +358,14 @@ class TargetCFM(nn.Module):
                 device=device,
                 dtype=context.dtype,
             )
-
             z = z + model(t_batch, z, context) * dt
 
         return z
 
 
-# ---------------------------------------------------------------------------
-# Image-only context encoder
-# ---------------------------------------------------------------------------
-
 class ContextEncoder(nn.Module):
     """
-    Assemble the image-only 243-dimensional context vector.
+    Assemble the mixed-resolution 2673-dimensional context vector.
 
     Inputs
     ------
@@ -371,60 +373,74 @@ class ContextEncoder(nn.Module):
         Contaminated neutral image, shape (N, 81).
 
     ch_charged_pu:
-        Charged pileup image, shape (N, 81).
+        Charged pileup image, shape (N, 1296).
 
     ch_charged_lv:
-        Charged leading-vertex image, shape (N, 81).
+        Charged leading-vertex image, shape (N, 1296).
 
     Output
     ------
     context:
-        Standardized and concatenated image context, shape (N, 243).
+        Standardized and concatenated image context, shape (N, 2673).
 
     Call ``fit`` using training rows only before training.
     """
 
-    def __init__(self, img_dim: int = IMG_DIM):
+    def __init__(
+        self,
+        neutral_dim: int = NEUTRAL_DIM,
+        charged_dim: int = CHARGED_DIM,
+    ):
         super().__init__()
 
-        self.img_dim = img_dim
-        self.context_dim = N_IMAGES * img_dim
+        if neutral_dim <= 0:
+            raise ValueError(
+                f"neutral_dim must be positive, got {neutral_dim}"
+            )
+
+        if charged_dim <= 0:
+            raise ValueError(
+                f"charged_dim must be positive, got {charged_dim}"
+            )
+
+        self.neutral_dim = neutral_dim
+        self.charged_dim = charged_dim
+        self.context_dim = neutral_dim + 2 * charged_dim
 
         self.register_buffer(
             "neutral_all_mean",
-            torch.zeros(img_dim),
+            torch.zeros(neutral_dim),
         )
         self.register_buffer(
             "neutral_all_std",
-            torch.ones(img_dim),
+            torch.ones(neutral_dim),
         )
-
         self.register_buffer(
             "charged_pu_mean",
-            torch.zeros(img_dim),
+            torch.zeros(charged_dim),
         )
         self.register_buffer(
             "charged_pu_std",
-            torch.ones(img_dim),
+            torch.ones(charged_dim),
         )
-
         self.register_buffer(
             "charged_lv_mean",
-            torch.zeros(img_dim),
+            torch.zeros(charged_dim),
         )
         self.register_buffer(
             "charged_lv_std",
-            torch.ones(img_dim),
+            torch.ones(charged_dim),
         )
 
+    @staticmethod
     def _validate_image(
-        self,
         image: torch.Tensor,
         name: str,
+        expected_dim: int,
     ) -> None:
-        if image.ndim != 2 or image.shape[1] != self.img_dim:
+        if image.ndim != 2 or image.shape[1] != expected_dim:
             raise ValueError(
-                f"Expected {name} shape (N, {self.img_dim}), "
+                f"Expected {name} shape (N, {expected_dim}), "
                 f"got {tuple(image.shape)}"
             )
 
@@ -433,12 +449,7 @@ class ContextEncoder(nn.Module):
         tensor: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mean = tensor.mean(dim=0)
-
-        std = tensor.std(
-            dim=0,
-            unbiased=False,
-        ).clamp(min=1e-6)
-
+        std = tensor.std(dim=0, unbiased=False).clamp(min=1e-6)
         return mean, std
 
     @torch.no_grad()
@@ -448,12 +459,22 @@ class ContextEncoder(nn.Module):
         ch_charged_pu: torch.Tensor,
         ch_charged_lv: torch.Tensor,
     ) -> None:
-        """
-        Fit per-pixel normalization statistics using training data only.
-        """
-        self._validate_image(ch_neutral_all, "ch_neutral_all")
-        self._validate_image(ch_charged_pu, "ch_charged_pu")
-        self._validate_image(ch_charged_lv, "ch_charged_lv")
+        """Fit per-pixel normalization statistics using training data only."""
+        self._validate_image(
+            ch_neutral_all,
+            "ch_neutral_all",
+            self.neutral_dim,
+        )
+        self._validate_image(
+            ch_charged_pu,
+            "ch_charged_pu",
+            self.charged_dim,
+        )
+        self._validate_image(
+            ch_charged_lv,
+            "ch_charged_lv",
+            self.charged_dim,
+        )
 
         if not (
             ch_neutral_all.shape[0]
@@ -462,20 +483,15 @@ class ContextEncoder(nn.Module):
         ):
             raise ValueError("Context image channels have different row counts.")
 
-        (
-            self.neutral_all_mean,
-            self.neutral_all_std,
-        ) = self._stats(ch_neutral_all)
-
-        (
-            self.charged_pu_mean,
-            self.charged_pu_std,
-        ) = self._stats(ch_charged_pu)
-
-        (
-            self.charged_lv_mean,
-            self.charged_lv_std,
-        ) = self._stats(ch_charged_lv)
+        self.neutral_all_mean, self.neutral_all_std = self._stats(
+            ch_neutral_all
+        )
+        self.charged_pu_mean, self.charged_pu_std = self._stats(
+            ch_charged_pu
+        )
+        self.charged_lv_mean, self.charged_lv_std = self._stats(
+            ch_charged_lv
+        )
 
     def forward(
         self,
@@ -483,12 +499,29 @@ class ContextEncoder(nn.Module):
         ch_charged_pu: torch.Tensor,
         ch_charged_lv: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Return the standardized 243-dimensional context vector.
-        """
-        self._validate_image(ch_neutral_all, "ch_neutral_all")
-        self._validate_image(ch_charged_pu, "ch_charged_pu")
-        self._validate_image(ch_charged_lv, "ch_charged_lv")
+        """Return the standardized 2673-dimensional context vector."""
+        self._validate_image(
+            ch_neutral_all,
+            "ch_neutral_all",
+            self.neutral_dim,
+        )
+        self._validate_image(
+            ch_charged_pu,
+            "ch_charged_pu",
+            self.charged_dim,
+        )
+        self._validate_image(
+            ch_charged_lv,
+            "ch_charged_lv",
+            self.charged_dim,
+        )
+
+        if not (
+            ch_neutral_all.shape[0]
+            == ch_charged_pu.shape[0]
+            == ch_charged_lv.shape[0]
+        ):
+            raise ValueError("Context image channels have different row counts.")
 
         neutral_all_z = (
             ch_neutral_all - self.neutral_all_mean
@@ -503,11 +536,7 @@ class ContextEncoder(nn.Module):
         ) / self.charged_lv_std
 
         context = torch.cat(
-            [
-                neutral_all_z,
-                charged_pu_z,
-                charged_lv_z,
-            ],
+            [neutral_all_z, charged_pu_z, charged_lv_z],
             dim=-1,
         )
 
@@ -520,10 +549,6 @@ class ContextEncoder(nn.Module):
         return context
 
 
-# ---------------------------------------------------------------------------
-# Image-only target preprocessor
-# ---------------------------------------------------------------------------
-
 class TargetPreprocessor(nn.Module):
     """
     Standardize and decode the 81-dimensional neutral-LV target image.
@@ -533,25 +558,19 @@ class TargetPreprocessor(nn.Module):
 
     Call ``fit`` using training rows only before training.
 
-    Decoding always restores physical units and clamps negative transverse
-    momentum to zero. An optional pixel threshold may be supplied explicitly,
-    but no threshold is applied by default.
-
-    Final physics comparisons should normally decode without thresholding and
-    apply one common detector-cell threshold to every method inside the
-    comparison code.
+    Decoding restores physical units and clamps negative transverse momentum
+    to zero. An optional pixel threshold may be supplied explicitly, but no
+    threshold is applied by default.
     """
 
     def __init__(
         self,
-        n_img: int = IMG_DIM,
+        n_img: int = N_TARGET,
     ):
         super().__init__()
 
         if n_img <= 0:
-            raise ValueError(
-                f"n_img must be positive, got {n_img}"
-            )
+            raise ValueError(f"n_img must be positive, got {n_img}")
 
         self.n_img = n_img
 
@@ -559,7 +578,6 @@ class TargetPreprocessor(nn.Module):
             "img_mean",
             torch.zeros(n_img),
         )
-
         self.register_buffer(
             "img_std",
             torch.ones(n_img),
@@ -572,8 +590,7 @@ class TargetPreprocessor(nn.Module):
     ) -> None:
         if image.ndim != 2 or image.shape[1] != self.n_img:
             raise ValueError(
-                f"Expected {name} shape "
-                f"(N, {self.n_img}), "
+                f"Expected {name} shape (N, {self.n_img}), "
                 f"got {tuple(image.shape)}"
             )
 
@@ -582,24 +599,14 @@ class TargetPreprocessor(nn.Module):
         self,
         neutral_lv: torch.Tensor,
     ) -> None:
-        """
-        Fit per-pixel target statistics using training rows only.
-        """
-        self._validate_image(
-            neutral_lv,
-            "neutral_lv",
-        )
+        """Fit per-pixel target statistics using training rows only."""
+        self._validate_image(neutral_lv, "neutral_lv")
 
-        self.img_mean = neutral_lv.mean(
-            dim=0,
-        )
-
+        self.img_mean = neutral_lv.mean(dim=0)
         self.img_std = neutral_lv.std(
             dim=0,
             unbiased=False,
-        ).clamp(
-            min=1e-6,
-        )
+        ).clamp(min=1e-6)
 
     def encode(
         self,
@@ -618,15 +625,8 @@ class TargetPreprocessor(nn.Module):
         torch.Tensor
             Standardized target image with shape (N, 81).
         """
-        self._validate_image(
-            neutral_lv,
-            "neutral_lv",
-        )
-
-        return (
-            neutral_lv
-            - self.img_mean
-        ) / self.img_std
+        self._validate_image(neutral_lv, "neutral_lv")
+        return (neutral_lv - self.img_mean) / self.img_std
 
     def decode(
         self,
@@ -644,50 +644,29 @@ class TargetPreprocessor(nn.Module):
         pt_threshold:
             Optional nonnegative pixel-pT threshold in GeV.
 
-            ``None`` or ``0.0``:
+            None or 0.0:
                 Return the raw nonnegative decoded image.
 
             Positive value:
                 Set decoded pixels below this threshold to zero.
-
-            Final comparisons should normally use ``None`` and apply a common
-            threshold to True, pileup, PUPPI, PUMML, and PileFlow together.
 
         Returns
         -------
         torch.Tensor
             Predicted neutral-LV pT image with shape (N, 81).
         """
-        self._validate_image(
-            z,
-            "flow output",
-        )
+        self._validate_image(z, "flow output")
 
-        if (
-            pt_threshold is not None
-            and pt_threshold < 0.0
-        ):
+        if pt_threshold is not None and pt_threshold < 0.0:
             raise ValueError(
                 "pt_threshold must be nonnegative or None, "
                 f"got {pt_threshold}"
             )
 
-        image = (
-            z
-            * self.img_std
-            + self.img_mean
-        )
+        image = z * self.img_std + self.img_mean
+        image = image.clamp(min=0.0)
 
-        # Transverse momentum cannot be negative.
-        image = image.clamp(
-            min=0.0,
-        )
-
-        # Thresholding is optional and must be requested explicitly.
-        if (
-            pt_threshold is not None
-            and pt_threshold > 0.0
-        ):
+        if pt_threshold is not None and pt_threshold > 0.0:
             image = torch.where(
                 image >= pt_threshold,
                 image,
@@ -696,7 +675,12 @@ class TargetPreprocessor(nn.Module):
 
         return image
 
+
 __all__ = [
+    "NEUTRAL_SIDE",
+    "CHARGED_SIDE",
+    "NEUTRAL_DIM",
+    "CHARGED_DIM",
     "IMG_DIM",
     "N_IMAGES",
     "N_SCALARS",
