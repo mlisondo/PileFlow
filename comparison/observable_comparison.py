@@ -61,15 +61,40 @@ LEADING_KEYS = [
     "ecf3_log",
 ]
 
-# Table 2 contains percent-error IQRs. Neutral N95 is excluded because
-# its reconstruction error is an absolute cell-count difference.
-IQR_KEYS = [
+# Reconstruction-error definitions used by Figure 5 and Table 2.
+PERCENT_ERROR_KEYS = [
     "jet_mass",
     "dijet_mass",
     "jet_pt",
+]
+
+LOG_RESIDUAL_KEYS = [
     "ecf2_log",
     "ecf3_log",
 ]
+
+ABSOLUTE_DIFFERENCE_KEYS = [
+    "neutral_n95",
+]
+
+ERROR_IQR_KEYS = [
+    "jet_mass",
+    "dijet_mass",
+    "jet_pt",
+    "neutral_n95",
+    "ecf2_log",
+    "ecf3_log",
+]
+
+# Minimum truth values used only when forming percentage residuals.
+# These prevent unstable division by very small positive observables. They are
+# numerical evaluation safeguards, not generator-level or event-selection cuts.
+# The selected values are reported in the table output.
+PERCENT_ERROR_TRUTH_MIN = {
+    "jet_mass": 1.0,     # GeV; excludes nearly massless truth jets
+    "dijet_mass": 1.0,   # GeV; excludes near-zero truth dijet masses
+    "jet_pt": 5.0,       # GeV; consistent with the clustering pT threshold
+}
 
 _AUX_KEYS = [
     "_reco_px",
@@ -115,6 +140,58 @@ LABELS  = {
     "puppi":     "PUPPI",
     "pumml":     "PUMML",
     "pileflow":  "PileFlow",
+}
+
+ERROR_AXIS_LABELS = {
+    "jet_mass": (
+        r"Centered $100(m^{\rm reco}-m^{\rm true})/"
+        r"m^{\rm true}$ [\%]"
+    ),
+    "dijet_mass": (
+        r"Centered $100(m_{jj}^{\rm reco}-m_{jj}^{\rm true})/"
+        r"m_{jj}^{\rm true}$ [\%]"
+    ),
+    "jet_pt": (
+        r"Centered $100(p_T^{\rm reco}-p_T^{\rm true})/"
+        r"p_T^{\rm true}$ [\%]"
+    ),
+    "neutral_n95": (
+        r"Centered $N_{95}^{\rm reco}-N_{95}^{\rm true}$ "
+        r"[neutral cells]"
+    ),
+    "ecf2_log": (
+        r"Centered $\Delta\ln\mathrm{ECF}_2$"
+    ),
+    "ecf3_log": (
+        r"Centered $\Delta\ln\mathrm{ECF}_3$"
+    ),
+}
+
+ERROR_FALLBACK_RANGES = {
+    "jet_mass": (-100.0, 100.0),
+    "dijet_mass": (-100.0, 100.0),
+    "jet_pt": (-100.0, 100.0),
+    "neutral_n95": (-5.0, 5.0),
+    "ecf2_log": (-2.0, 2.0),
+    "ecf3_log": (-2.0, 2.0),
+}
+
+ERROR_NAMES = {
+    "jet_mass": "percent residual",
+    "dijet_mass": "percent residual",
+    "jet_pt": "percent residual",
+    "neutral_n95": "absolute difference",
+    "ecf2_log": "log residual",
+    "ecf3_log": "log residual",
+}
+
+ERROR_UNITS = {
+    "jet_mass": "%",
+    "dijet_mass": "%",
+    "jet_pt": "%",
+    "neutral_n95": "cells",
+    "ecf2_log": "log units",
+    "ecf3_log": "log units",
 }
 
 # Jet image grid constants
@@ -1102,53 +1179,98 @@ def make_figure4(store: dict, plots_dir: str, mean_npu: float = 50.0):
     _save_fig(fig, plots_dir, "figure4_distributions")
 
 
-def _centered_reconstruction_error(
+def _reconstruction_error(
     truth: np.ndarray,
     prediction: np.ndarray,
     key: str,
-) -> np.ndarray:
+    *,
+    centered: bool = False,
+) -> tuple[np.ndarray, int]:
     """
-    Return the paper-style centered reconstruction error.
+    Compute a numerically stable reconstruction error.
+
+    Definitions
+    -----------
+    Jet mass, dijet mass, jet pT:
+        Percent residual = 100 * (prediction - truth) / truth
 
     Neutral N95:
-        prediction - truth, in cells.
+        prediction - truth
 
-    Other observables:
-        100 * (prediction - truth) / abs(truth), in percent.
+    Logged ECF2 and ECF3:
+        prediction_log - truth_log
+
+    Parameters
+    ----------
+    truth, prediction:
+        Row-aligned observable arrays.
+
+    key:
+        Observable key.
+
+    centered:
+        Subtract the median error when True. Centering is performed separately
+        for each method when Figure 5 is built.
+
+    Returns
+    -------
+    errors:
+        One-dimensional array of valid reconstruction errors.
+
+    n_valid:
+        Number of rows entering the calculation.
     """
+    truth = np.asarray(truth, dtype=np.float64)
+    prediction = np.asarray(prediction, dtype=np.float64)
+
+    if truth.shape != prediction.shape:
+        raise ValueError(
+            "Truth and prediction arrays must have the same shape: "
+            f"{truth.shape} versus {prediction.shape}"
+        )
+
     mask = (
         np.isfinite(truth)
         & np.isfinite(prediction)
     )
 
-    if key == "neutral_n95":
-        error = (
-            prediction[mask]
-            - truth[mask]
+    if key in PERCENT_ERROR_KEYS:
+        truth_min = PERCENT_ERROR_TRUTH_MIN[key]
+
+        # These physical observables are nonnegative, so require truth > min.
+        mask &= truth > truth_min
+
+        errors = (
+            100.0
+            * (prediction[mask] - truth[mask])
+            / truth[mask]
         )
+
+    elif key in LOG_RESIDUAL_KEYS:
+        # The stored values are already logarithms:
+        #
+        # prediction - truth
+        # = log(ECF_pred) - log(ECF_true)
+        # = log(ECF_pred / ECF_true)
+        errors = prediction[mask] - truth[mask]
+
+    elif key in ABSOLUTE_DIFFERENCE_KEYS:
+        errors = prediction[mask] - truth[mask]
 
     else:
-        mask &= np.abs(truth) > 1e-6
-
-        error = (
-            100.0
-            * (
-                prediction[mask]
-                - truth[mask]
-            )
-            / np.abs(truth[mask])
+        raise KeyError(
+            f"No reconstruction-error definition for observable {key!r}"
         )
 
-    if error.size:
-        error = (
-            error
-            - np.median(error)
-        )
+    errors = errors[np.isfinite(errors)]
 
-    return error
+    if centered and errors.size:
+        errors = errors - np.median(errors)
+
+    return errors, int(errors.size)
 
 
-# Figure 5 — percent-error distributions
+# Figure 5 — centered reconstruction-error distributions
 def make_figure5(
     store: dict,
     plots_dir: str,
@@ -1157,8 +1279,12 @@ def make_figure5(
     """
     Centered reconstruction-error distributions.
 
-    Continuous observables use percent error.
+    Masses and jet pT use percentage residuals.
     Neutral N95 uses an absolute cell-count difference.
+    Logged ECF observables use log residuals.
+
+    Each method is shifted by its own median. The figure therefore compares
+    distribution shape and resolution, not median reconstruction bias.
     """
     compare = [
         method
@@ -1199,11 +1325,12 @@ def make_figure5(
         truth = store["true"][key]
 
         method_errors = {
-            method: _centered_reconstruction_error(
+            method: _reconstruction_error(
                 truth,
                 store[method][key],
                 key,
-            )
+                centered=True,
+            )[0]
             for method in compare
         }
 
@@ -1240,16 +1367,12 @@ def make_figure5(
             )
         )
 
-        if key != "neutral_n95":
+        if key in PERCENT_ERROR_KEYS:
             low = max(low, -500.0)
             high = min(high, 500.0)
 
-        if low >= high:
-            low, high = (
-                (-5.0, 5.0)
-                if key == "neutral_n95"
-                else (-100.0, 100.0)
-            )
+        if not np.isfinite(low) or not np.isfinite(high) or low >= high:
+            low, high = ERROR_FALLBACK_RANGES[key]
 
         edges = np.linspace(
             low,
@@ -1302,17 +1425,10 @@ def make_figure5(
             alpha=0.7,
         )
 
-        if key == "neutral_n95":
-            axis.set_xlabel(
-                r"$N_{95}^{\rm reco}-N_{95}^{\rm true}$ "
-                "[neutral cells], centered",
-                fontsize=9,
-            )
-        else:
-            axis.set_xlabel(
-                f"Centered % error [{OBS_LABELS[key]}]",
-                fontsize=9,
-            )
+        axis.set_xlabel(
+            ERROR_AXIS_LABELS[key],
+            fontsize=9,
+        )
 
         axis.set_ylabel(
             "Normalised",
@@ -1342,6 +1458,42 @@ def make_figure5(
         plots_dir,
         "figure5_reconstruction_errors",
     )
+
+def _safe_pearson_percent(
+    truth: np.ndarray,
+    prediction: np.ndarray,
+    min_count: int = 5,
+) -> tuple[float, int]:
+    """
+    Return 100 * Pearson r, or NaN when correlation is undefined.
+    """
+    truth = np.asarray(truth, dtype=np.float64)
+    prediction = np.asarray(prediction, dtype=np.float64)
+
+    mask = (
+        np.isfinite(truth)
+        & np.isfinite(prediction)
+    )
+
+    x = truth[mask]
+    y = prediction[mask]
+
+    n_valid = len(x)
+
+    if n_valid < min_count:
+        return np.nan, n_valid
+
+    if np.std(x) <= 1e-12 or np.std(y) <= 1e-12:
+        return np.nan, n_valid
+
+    from scipy.stats import pearsonr
+
+    correlation, _ = pearsonr(x, y)
+
+    if not np.isfinite(correlation):
+        return np.nan, n_valid
+
+    return float(100.0 * correlation), n_valid
 
 def make_wasserstein_table(store: dict, plots_dir: str):
     """
@@ -1502,25 +1654,27 @@ def make_wasserstein_table(store: dict, plots_dir: str):
 
     return raw_table, normalized_table
 
+
 # Tables 1 & 2
 def make_tables(
     store: dict,
     plots_dir: str,
 ):
     """
-    Produce:
+    Produce two summary tables.
 
-      Table 1:
-          Pearson correlation coefficient, multiplied by 100.
+    Table 1
+    -------
+    Pearson correlation coefficient, multiplied by 100.
 
-      Table 2:
-          IQR of continuous-observable percent errors.
+    Table 2
+    -------
+    IQR of the observable-specific reconstruction error:
 
-      Additional diagnostic:
-          IQR of neutral-N95 absolute differences, in cells.
+      * jet mass, dijet mass and jet pT: percentage residual [%]
+      * neutral N95: absolute difference [cells]
+      * logged ECF2 and ECF3: log residual [log units]
     """
-    from scipy.stats import pearsonr
-
     compare = [
         method
         for method in [
@@ -1539,91 +1693,53 @@ def make_tables(
         for method in compare
     }
 
-    table2 = {
+    pearson_n_valid = {
         method: {}
         for method in compare
     }
 
-    n95_difference_iqr = {}
+    error_iqr = {
+        method: {}
+        for method in compare
+    }
+
+    error_n_valid = {
+        method: {}
+        for method in compare
+    }
 
     for method in compare:
         for key in OBS_KEYS:
-            true_values = truth[key]
-            predicted_values = store[method][key]
-
-            mask = (
-                np.isfinite(true_values)
-                & np.isfinite(predicted_values)
+            correlation, n_valid = _safe_pearson_percent(
+                truth[key],
+                store[method][key],
             )
 
-            if mask.sum() < 5:
-                table1[method][key] = np.nan
+            table1[method][key] = correlation
+            pearson_n_valid[method][key] = n_valid
+
+        for key in ERROR_IQR_KEYS:
+            # IQR is invariant under a constant shift, so the raw and
+            # median-centered error distributions have the same IQR.
+            errors, n_valid = _reconstruction_error(
+                truth[key],
+                store[method][key],
+                key,
+                centered=False,
+            )
+
+            error_n_valid[method][key] = n_valid
+
+            if n_valid < 5:
+                error_iqr[method][key] = np.nan
                 continue
-
-            correlation, _ = pearsonr(
-                true_values[mask],
-                predicted_values[mask],
-            )
-
-            table1[method][key] = float(
-                100.0 * correlation
-            )
-
-        for key in IQR_KEYS:
-            true_values = truth[key]
-            predicted_values = store[method][key]
-
-            mask = (
-                np.isfinite(true_values)
-                & np.isfinite(predicted_values)
-                & (np.abs(true_values) > 1e-6)
-            )
-
-            if mask.sum() < 5:
-                table2[method][key] = np.nan
-                continue
-
-            error = (
-                100.0
-                * (
-                    predicted_values[mask]
-                    - true_values[mask]
-                )
-                / np.abs(true_values[mask])
-            )
 
             q25, q75 = np.percentile(
-                error,
+                errors,
                 [25, 75],
             )
 
-            table2[method][key] = float(
-                q75 - q25
-            )
-
-        true_n95 = truth["neutral_n95"]
-        predicted_n95 = store[method]["neutral_n95"]
-
-        n95_mask = (
-            np.isfinite(true_n95)
-            & np.isfinite(predicted_n95)
-        )
-
-        if n95_mask.sum() < 5:
-            n95_difference_iqr[method] = np.nan
-
-        else:
-            difference = (
-                predicted_n95[n95_mask]
-                - true_n95[n95_mask]
-            )
-
-            q25, q75 = np.percentile(
-                difference,
-                [25, 75],
-            )
-
-            n95_difference_iqr[method] = float(
+            error_iqr[method][key] = float(
                 q75 - q25
             )
 
@@ -1638,43 +1754,60 @@ def make_tables(
             "% (higher = better)",
         )
 
-        _print_table(
-            "Table 2 — IQR of percent-error distribution (%)",
-            table2,
-            compare,
-            IQR_KEYS,
-            "% (lower = better)",
-        )
-
         print(
-            "\nNeutral N95 difference IQR [cells]"
+            "\nTable 2 — IQR of reconstruction-error distribution"
         )
-        print("-" * 76)
 
+        column_width = 14
         header = (
             f"{'Observable':<18}"
+            f"{'Unit':<12}"
             + "".join(
-                f"{LABELS[method]:>14}"
+                f"{LABELS[method]:>{column_width}}"
                 for method in compare
             )
         )
 
+        separator = "-" * max(
+            len(header),
+            72,
+        )
+
+        print(separator)
         print(header)
-        print("-" * 76)
+        print(separator)
 
-        row = f"{'Neutral N95':<18}"
-
-        for method in compare:
-            value = n95_difference_iqr[method]
-
-            row += (
-                f"{value:>14.2f}"
-                if np.isfinite(value)
-                else f"{'N/A':>14}"
+        for key in ERROR_IQR_KEYS:
+            row = (
+                f"{OBS_SHORT[key]:<18}"
+                f"{ERROR_UNITS[key]:<12}"
             )
 
-        print(row)
-        print("-" * 76)
+            for method in compare:
+                value = error_iqr[method][key]
+
+                row += (
+                    f"{value:>{column_width}.3f}"
+                    if np.isfinite(value)
+                    else f"{'N/A':>{column_width}}"
+                )
+
+            print(row)
+
+        print(separator)
+        print(
+            "  definitions: percent residual = "
+            "100*(prediction-truth)/truth; "
+            "log residual = prediction_log-truth_log"
+        )
+        print(
+            "  truth thresholds for fractional errors: "
+            + ", ".join(
+                f"{OBS_SHORT[key]}>{threshold:g} GeV"
+                for key, threshold in PERCENT_ERROR_TRUTH_MIN.items()
+            )
+        )
+        print("  lower IQR is better\n")
 
     text = output.getvalue()
     print(text)
@@ -1724,18 +1857,18 @@ def make_tables(
         writer.writerow([])
 
         writer.writerow(
-            ["Table 2 - Percent-error IQR (%)"]
+            ["Table 1 - valid row count"]
             + [
                 LABELS[method]
                 for method in compare
             ]
         )
 
-        for key in IQR_KEYS:
+        for key in OBS_KEYS:
             writer.writerow(
                 [OBS_SHORT[key]]
                 + [
-                    table2[method][key]
+                    pearson_n_valid[method][key]
                     for method in compare
                 ]
             )
@@ -1743,20 +1876,56 @@ def make_tables(
         writer.writerow([])
 
         writer.writerow(
-            ["Neutral N95 difference IQR (cells)"]
+            [
+                "Table 2 - Reconstruction-error IQR",
+                "Error definition",
+                "Unit",
+            ]
             + [
                 LABELS[method]
                 for method in compare
             ]
         )
 
+        for key in ERROR_IQR_KEYS:
+            writer.writerow(
+                [
+                    OBS_SHORT[key],
+                    ERROR_NAMES[key],
+                    ERROR_UNITS[key],
+                ]
+                + [
+                    error_iqr[method][key]
+                    for method in compare
+                ]
+            )
+
+        writer.writerow([])
+
         writer.writerow(
-            ["Neutral N95"]
+            [
+                "Table 2 - valid row count",
+                "Error definition",
+                "Unit",
+            ]
             + [
-                n95_difference_iqr[method]
+                LABELS[method]
                 for method in compare
             ]
         )
+
+        for key in ERROR_IQR_KEYS:
+            writer.writerow(
+                [
+                    OBS_SHORT[key],
+                    ERROR_NAMES[key],
+                    ERROR_UNITS[key],
+                ]
+                + [
+                    error_n_valid[method][key]
+                    for method in compare
+                ]
+            )
 
     print(
         f"  [tables] TXT -> {txt_path}"
@@ -1765,9 +1934,15 @@ def make_tables(
         f"  [tables] CSV -> {csv_path}"
     )
 
+    # Preserve the previous three-object return shape.
+    n95_difference_iqr = {
+        method: error_iqr[method]["neutral_n95"]
+        for method in compare
+    }
+
     return (
         table1,
-        table2,
+        error_iqr,
         n95_difference_iqr,
     )
 
