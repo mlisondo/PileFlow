@@ -20,6 +20,13 @@ PileFlow context:
 
 PileFlow target:
   ch_neutral_lv - neutral leading-vertex image, 9x9
+
+Evaluation sampling:
+  During evaluation, PileFlow may generate multiple independent samples for
+  each conditioning input. The samples are averaged pixel-by-pixel before
+  computing images, jet observables, plots, and metrics.
+
+  eval_samples = 1 preserves the original single-sample behavior.
 """
 
 from dataclasses import dataclass
@@ -58,6 +65,13 @@ class Config:
 
     # Generation / evaluation
     eval_batch: int = 512
+
+    # Number of independent conditional-flow samples generated per jet during
+    # evaluation. The decoded images are averaged pixel-by-pixel before any
+    # downstream observable or metric is computed.
+    #
+    # This setting is evaluation-only and does not affect training.
+    eval_samples: int = 1
 
     # Image-only model contract
     image_channel_keys: tuple[str, str, str] = (
@@ -111,7 +125,10 @@ class Config:
     def channel_shapes(self) -> dict[str, tuple[int, int]]:
         """Expected spatial shape of each conditioning image."""
         return {
-            "ch_neutral_all_raw": (self.image_size, self.image_size),
+            "ch_neutral_all_raw": (
+                self.image_size,
+                self.image_size,
+            ),
             "ch_charged_pu": (
                 self.charged_image_size,
                 self.charged_image_size,
@@ -124,12 +141,15 @@ class Config:
 
     def __post_init__(self) -> None:
         if self.image_size <= 0:
-            raise ValueError(f"image_size must be positive, got {self.image_size}")
+            raise ValueError(
+                f"image_size must be positive, got {self.image_size}"
+            )
 
         if self.charged_image_size <= 0:
             raise ValueError(
                 "charged_image_size must be positive, "
-                f"got {self.charged_image_size}")
+                f"got {self.charged_image_size}"
+            )
 
         if len(self.image_channel_keys) != 3:
             raise ValueError(
@@ -150,6 +170,12 @@ class Config:
         if self.eval_batch <= 0:
             raise ValueError(
                 f"eval_batch must be positive, got {self.eval_batch}"
+            )
+
+        if self.eval_samples <= 0:
+            raise ValueError(
+                "eval_samples must be a positive integer, "
+                f"got {self.eval_samples}"
             )
 
         if self.flow_hidden <= 0:
