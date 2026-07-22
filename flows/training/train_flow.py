@@ -501,6 +501,7 @@ def train_pileflow(
 
     return model
 
+
 def generate_and_save(
     npz_path: str,
     flow_ckpt: str,
@@ -511,19 +512,41 @@ def generate_and_save(
     """
     Load a PileFlow checkpoint and generate neutral-LV predictions.
 
-    For each conditioning input, generate ``cfg.eval_samples`` independent
-    flow samples and average the decoded images pixel-by-pixel:
+    For every conditioning input, generate ``cfg.eval_samples`` independent
+    decoded flow samples.
 
-        prediction = (1 / N) * sum_s prediction_s
+    Two prediction modes are retained:
 
-    The averaged image is then saved and used by all downstream diagnostics.
+        neutral_lv_pred_single
+            The first generated sample, Y^(1).
 
-    ``eval_samples=1`` preserves the original single-sample behavior.
+        neutral_lv_pred_mean
+            The pixelwise mean of all N decoded samples:
+
+                mean_prediction = (1 / N) * sum_s prediction_s
+
+    ``neutral_lv_pred`` remains an alias of ``neutral_lv_pred_mean`` so that
+    existing observable-evaluation code continues to use the mean prediction.
+
+    For ``eval_samples=1``:
+
+        neutral_lv_pred_single
+        == neutral_lv_pred_mean
+        == neutral_lv_pred
     """
     if n_steps <= 0:
-        raise ValueError(f"n_steps must be positive, got {n_steps}")
+        raise ValueError(
+            f"n_steps must be positive, got {n_steps}"
+        )
 
-    eval_samples = int(getattr(cfg, "eval_samples", 1))
+    eval_samples = int(
+        getattr(
+            cfg,
+            "eval_samples",
+            1,
+        )
+    )
+
     if eval_samples <= 0:
         raise ValueError(
             f"eval_samples must be positive, got {eval_samples}"
@@ -533,11 +556,25 @@ def generate_and_save(
     np.random.seed(cfg.seed)
 
     device = torch.device(cfg.device)
-    out_dir = out_dir or os.path.join(cfg.outdir, "data")
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    state = _load_checkpoint(flow_ckpt, device)
-    saved_cfg = _validate_checkpoint_contract(state)
+    out_dir = out_dir or os.path.join(
+        cfg.outdir,
+        "data",
+    )
+
+    Path(out_dir).mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    state = _load_checkpoint(
+        flow_ckpt,
+        device,
+    )
+
+    saved_cfg = _validate_checkpoint_contract(
+        state
+    )
 
     model = CRTVelocityField(
         n_features=saved_cfg["n_target"],
@@ -547,20 +584,32 @@ def generate_and_save(
         time_emb_dim=saved_cfg["flow_time_emb"],
         dropout=0.0,
     ).to(device)
-    model.load_state_dict(state["model"])
+
+    model.load_state_dict(
+        state["model"]
+    )
+
     model.eval()
 
     ctx_enc = ContextEncoder(
         neutral_dim=saved_cfg["neutral_dim"],
         charged_dim=saved_cfg["charged_dim"],
     ).to(device)
-    ctx_enc.load_state_dict(state["ctx_enc"])
+
+    ctx_enc.load_state_dict(
+        state["ctx_enc"]
+    )
+
     ctx_enc.eval()
 
     tgt_prep = TargetPreprocessor(
         n_img=saved_cfg["n_target"],
     ).to(device)
-    tgt_prep.load_state_dict(state["tgt_prep"])
+
+    tgt_prep.load_state_dict(
+        state["tgt_prep"]
+    )
+
     tgt_prep.eval()
 
     cfm = TargetCFM(
@@ -569,7 +618,11 @@ def generate_and_save(
 
     dataset = PileFlowDataset(
         npz_path=npz_path,
-        max_n=getattr(cfg, "max_jets", None),
+        max_n=getattr(
+            cfg,
+            "max_jets",
+            None,
+        ),
     )
 
     if len(dataset) == 0:
@@ -582,13 +635,19 @@ def generate_and_save(
         batch_size=getattr(
             cfg,
             "eval_batch",
-            getattr(cfg, "flow_batch", 512),
+            getattr(
+                cfg,
+                "flow_batch",
+                512,
+            ),
         ),
         shuffle=False,
         num_workers=0,
     )
 
-    all_pred = []
+    all_pred_single = []
+    all_pred_mean = []
+
     all_true = []
     all_neutral_all = []
     all_charged_pu = []
@@ -598,12 +657,25 @@ def generate_and_save(
         "  [generate] Running mixed-resolution image-only "
         "PileFlow ODE integration ..."
     )
+
     print(
         f"  [generate] Samples per jet: {eval_samples}"
     )
+
     print(
-        "  [generate] Aggregation: pixelwise mean after decoding"
+        "  [generate] Single prediction: first decoded sample"
     )
+
+    print(
+        "  [generate] Mean prediction: pixelwise mean "
+        "after decoding"
+    )
+
+    print(
+        "  [generate] Downstream neutral_lv_pred: "
+        "mean prediction"
+    )
+
     print(
         "  [generate] Decode: clamp pT >= 0, "
         "no positive pixel threshold"
@@ -612,7 +684,10 @@ def generate_and_save(
     with torch.no_grad():
         for batch in loader:
             neutral_lv, neutral_all, charged_pu, charged_lv = (
-                _batch_to_device(batch, device)
+                _batch_to_device(
+                    batch,
+                    device,
+                )
             )
 
             context = ctx_enc(
@@ -621,6 +696,7 @@ def generate_and_save(
                 charged_lv,
             )
 
+            single_image = None
             mean_image = None
 
             for sample_index in range(eval_samples):
@@ -636,94 +712,244 @@ def generate_and_save(
                     pt_threshold=None,
                 )
 
-                if not torch.isfinite(sample_image).all():
+                if not torch.isfinite(
+                    sample_image
+                ).all():
                     raise RuntimeError(
                         "PileFlow generated non-finite decoded pixels "
                         f"in evaluation sample {sample_index + 1}."
                     )
 
-                if torch.any(sample_image < 0.0):
+                if torch.any(
+                    sample_image < 0.0
+                ):
                     raise RuntimeError(
                         "PileFlow decoder returned negative-pT pixels "
                         f"in evaluation sample {sample_index + 1}."
                     )
 
-                # Online mean:
-                #
-                # mean_s = mean_{s-1}
-                #          + (sample_s - mean_{s-1}) / s
-                #
-                # This avoids storing a tensor with shape
-                # (eval_samples, batch_size, 81).
-                if mean_image is None:
-                    mean_image = sample_image
+                if sample_index == 0:
+                    # Preserve the first stochastic prediction as the
+                    # fixed single-sample diagnostic.
+                    #
+                    # clone() is important because the running mean will
+                    # subsequently be updated.
+                    single_image = sample_image.clone()
+                    mean_image = sample_image.clone()
+
                 else:
-                    mean_image += (
+                    # Online mean:
+                    #
+                    # mean_s = mean_{s-1}
+                    #          + (sample_s - mean_{s-1}) / s
+                    #
+                    # sample_index is zero-based, so the number of samples
+                    # included after this update is sample_index + 1.
+                    mean_image = mean_image + (
                         sample_image - mean_image
                     ) / float(sample_index + 1)
 
-            if mean_image is None:
+            if single_image is None or mean_image is None:
                 raise RuntimeError(
                     "PileFlow evaluation produced no samples."
                 )
 
-            if not torch.isfinite(mean_image).all():
+            if not torch.isfinite(
+                single_image
+            ).all():
                 raise RuntimeError(
-                    "Mean PileFlow prediction contains non-finite pixels."
+                    "Single-sample PileFlow prediction contains "
+                    "non-finite pixels."
                 )
 
-            if torch.any(mean_image < 0.0):
+            if not torch.isfinite(
+                mean_image
+            ).all():
                 raise RuntimeError(
-                    "Mean PileFlow prediction contains negative-pT pixels."
+                    "Mean PileFlow prediction contains "
+                    "non-finite pixels."
                 )
 
-            all_pred.append(mean_image.cpu().numpy())
-            all_true.append(neutral_lv.cpu().numpy())
-            all_neutral_all.append(neutral_all.cpu().numpy())
-            all_charged_pu.append(charged_pu.cpu().numpy())
-            all_charged_lv.append(charged_lv.cpu().numpy())
+            if torch.any(
+                single_image < 0.0
+            ):
+                raise RuntimeError(
+                    "Single-sample PileFlow prediction contains "
+                    "negative-pT pixels."
+                )
+
+            if torch.any(
+                mean_image < 0.0
+            ):
+                raise RuntimeError(
+                    "Mean PileFlow prediction contains "
+                    "negative-pT pixels."
+                )
+
+            all_pred_single.append(
+                single_image.cpu().numpy()
+            )
+
+            all_pred_mean.append(
+                mean_image.cpu().numpy()
+            )
+
+            all_true.append(
+                neutral_lv.cpu().numpy()
+            )
+
+            all_neutral_all.append(
+                neutral_all.cpu().numpy()
+            )
+
+            all_charged_pu.append(
+                charged_pu.cpu().numpy()
+            )
+
+            all_charged_lv.append(
+                charged_lv.cpu().numpy()
+            )
+
+    prediction_single = np.concatenate(
+        all_pred_single,
+        axis=0,
+    )
+
+    prediction_mean = np.concatenate(
+        all_pred_mean,
+        axis=0,
+    )
 
     results = {
-        "neutral_lv_pred": np.concatenate(all_pred, axis=0),
-        "neutral_lv_true": np.concatenate(all_true, axis=0),
-        "neutral_all_9x9": np.concatenate(all_neutral_all, axis=0),
-        "charged_pu_36x36": np.concatenate(all_charged_pu, axis=0),
-        "charged_lv_36x36": np.concatenate(all_charged_lv, axis=0),
+        # Backward-compatible prediction used by observable_comparison.py.
+        "neutral_lv_pred": prediction_mean,
+
+        # Explicit prediction modes for image diagnostics.
+        "neutral_lv_pred_single": prediction_single,
+        "neutral_lv_pred_mean": prediction_mean,
+
+        # Evaluation truth and conditioning images.
+        "neutral_lv_true": np.concatenate(
+            all_true,
+            axis=0,
+        ),
+        "neutral_all_9x9": np.concatenate(
+            all_neutral_all,
+            axis=0,
+        ),
+        "charged_pu_36x36": np.concatenate(
+            all_charged_pu,
+            axis=0,
+        ),
+        "charged_lv_36x36": np.concatenate(
+            all_charged_lv,
+            axis=0,
+        ),
+
+        # Scalar metadata saved in the NPZ file.
+        "eval_samples": np.asarray(
+            eval_samples,
+            dtype=np.int64,
+        ),
     }
 
     expected_rows = len(dataset)
-    n_generated = results["neutral_lv_pred"].shape[0]
+
+    n_generated = results[
+        "neutral_lv_pred_mean"
+    ].shape[0]
 
     if n_generated != expected_rows:
         raise RuntimeError(
-            "Generated prediction row count does not match the input dataset: "
+            "Generated prediction row count does not match "
+            "the input dataset: "
             f"generated={n_generated}, dataset={expected_rows}"
         )
 
     expected_shapes = {
-        "neutral_lv_pred": (expected_rows, N_TARGET),
-        "neutral_lv_true": (expected_rows, N_TARGET),
-        "neutral_all_9x9": (expected_rows, NEUTRAL_DIM),
-        "charged_pu_36x36": (expected_rows, CHARGED_DIM),
-        "charged_lv_36x36": (expected_rows, CHARGED_DIM),
+        "neutral_lv_pred": (
+            expected_rows,
+            N_TARGET,
+        ),
+        "neutral_lv_pred_single": (
+            expected_rows,
+            N_TARGET,
+        ),
+        "neutral_lv_pred_mean": (
+            expected_rows,
+            N_TARGET,
+        ),
+        "neutral_lv_true": (
+            expected_rows,
+            N_TARGET,
+        ),
+        "neutral_all_9x9": (
+            expected_rows,
+            NEUTRAL_DIM,
+        ),
+        "charged_pu_36x36": (
+            expected_rows,
+            CHARGED_DIM,
+        ),
+        "charged_lv_36x36": (
+            expected_rows,
+            CHARGED_DIM,
+        ),
     }
 
-    for key, array in results.items():
-        if array.shape != expected_shapes[key]:
+    for key, expected_shape in expected_shapes.items():
+        array = results[key]
+
+        if array.shape != expected_shape:
             raise RuntimeError(
-                f"Generated output {key!r} has shape {array.shape}; "
-                f"expected {expected_shapes[key]}."
+                f"Generated output {key!r} has shape "
+                f"{array.shape}; expected {expected_shape}."
             )
 
-        if not np.isfinite(array).all():
+        if not np.isfinite(
+            array
+        ).all():
             raise RuntimeError(
-                f"Generated output {key!r} contains non-finite values."
+                f"Generated output {key!r} contains "
+                "non-finite values."
             )
 
-    if np.any(results["neutral_lv_pred"] < 0.0):
+    if np.any(
+        results["neutral_lv_pred_single"] < 0.0
+    ):
         raise RuntimeError(
-            "Saved PileFlow predictions contain negative-pT pixels."
+            "Saved single-sample PileFlow predictions "
+            "contain negative-pT pixels."
         )
+
+    if np.any(
+        results["neutral_lv_pred_mean"] < 0.0
+    ):
+        raise RuntimeError(
+            "Saved mean PileFlow predictions contain "
+            "negative-pT pixels."
+        )
+
+    # The backward-compatible prediction must be exactly the same array
+    # numerically as the explicitly named mean prediction.
+    if not np.array_equal(
+        results["neutral_lv_pred"],
+        results["neutral_lv_pred_mean"],
+    ):
+        raise RuntimeError(
+            "neutral_lv_pred is not identical to "
+            "neutral_lv_pred_mean."
+        )
+
+    if eval_samples == 1:
+        if not np.array_equal(
+            results["neutral_lv_pred_single"],
+            results["neutral_lv_pred_mean"],
+        ):
+            raise RuntimeError(
+                "For eval_samples=1, the single and mean "
+                "predictions must be identical."
+            )
 
     output_path = os.path.join(
         out_dir,
@@ -739,14 +965,34 @@ def generate_and_save(
         f"  [generate] Generated predictions for "
         f"{n_generated:,} jets."
     )
+
     print(
-        f"  [generate] Samples averaged per jet: {eval_samples}"
+        f"  [generate] Samples generated per jet: "
+        f"{eval_samples}"
     )
+
+    print(
+        "  [generate] Saved single prediction key: "
+        "neutral_lv_pred_single"
+    )
+
+    print(
+        "  [generate] Saved mean prediction key: "
+        "neutral_lv_pred_mean"
+    )
+
+    print(
+        "  [generate] Observable comparison key: "
+        "neutral_lv_pred -> mean"
+    )
+
     print(
         f"  [generate] Saved -> {output_path}"
     )
 
     return results
+
+
 
 def _plot_loss_curve(
     history: dict[str, list[float]],

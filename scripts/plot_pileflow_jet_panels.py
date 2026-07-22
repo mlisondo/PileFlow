@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
 """
-Visualize detector-grid jet images and PileFlow neutral-LV predictions.
+Visualize single-sample and N-sample-mean PileFlow predictions.
 
-Each per-jet panel contains:
+The generated NPZ must contain:
 
-1. contaminated neutral input, 9x9;
-2. charged-PU context, 36x36;
-3. charged-LV context, 36x36;
-4. true neutral-LV target, 9x9;
-5. PileFlow neutral-LV prediction, 9x9;
-6. prediction minus truth residual, 9x9.
+    neutral_lv_pred_single
+        First stochastic PileFlow sample for each jet.
 
-The script also writes:
-- mean_panel.png;
-- jet_metrics.csv;
-- one PNG per selected jet.
+    neutral_lv_pred_mean
+        Pixelwise mean of N independently generated samples for each jet.
+
+The script creates four folders containing M panels:
+
+    single_best_mae/
+    single_worst_mae/
+    mean_best_total_pt/
+    mean_worst_total_pt/
+
+It also creates paired_extremes/ with exactly four comparison plots:
+
+    1. best single-sample MAE event;
+    2. best N-sample-mean MAE event;
+    3. worst single-sample MAE event;
+    4. worst N-sample-mean MAE event.
+
+Every panel uses a 2x4 layout:
+
+Top row:
+    contaminated neutral | charged PU | charged LV | truth neutral LV
+
+Bottom row:
+    single prediction | single residual | N-sample mean | mean residual
 """
 
 from __future__ import annotations
@@ -24,6 +40,7 @@ import csv
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -36,7 +53,11 @@ PHI_RANGE = 0.45
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create single-sample and N-sample-mean PileFlow jet panels."
+        )
+    )
 
     parser.add_argument(
         "--input-npz",
@@ -46,34 +67,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--generated-npz",
         required=True,
-        help="PileFlow data/generated_jets.npz.",
+        help=(
+            "PileFlow data/generated_jets.npz containing the single and "
+            "mean prediction keys."
+        ),
     )
     parser.add_argument(
         "--outdir",
         required=True,
-        help="Output directory for per-jet panels.",
+        help="Root output directory.",
     )
     parser.add_argument(
         "--max-jets",
         type=int,
-        default=50,
-        help="Maximum number of individual panels to save.",
-    )
-    parser.add_argument(
-        "--selection",
-        choices=[
-            "first",
-            "worst-mae",
-            "best-mae",
-            "worst-total-pt",
-        ],
-        default="first",
-        help="How to select the displayed jets.",
+        default=12,
+        help=(
+            "Number M of panels written to each of the four main folders. "
+            "Default: 12."
+        ),
     )
     parser.add_argument(
         "--dpi",
         type=int,
-        default=140,
+        default=180,
+        help="PNG resolution. Default: 180.",
     )
 
     return parser.parse_args()
@@ -101,9 +118,29 @@ def image_batch(
     )
 
 
+def require_equal_rows(arrays: dict[str, np.ndarray]) -> int:
+    """Require all row-aligned arrays to contain the same number of jets."""
+    lengths = {
+        key: len(value)
+        for key, value in arrays.items()
+    }
+
+    if len(set(lengths.values())) != 1:
+        details = ", ".join(
+            f"{key}={length}"
+            for key, length in lengths.items()
+        )
+        raise ValueError(
+            "Input arrays are not row aligned: "
+            f"{details}"
+        )
+
+    return next(iter(lengths.values()))
+
+
 def show_positive(
     fig,
-    ax,
+    axis,
     image: np.ndarray,
     title: str,
     vmax: float | None = None,
@@ -116,7 +153,7 @@ def show_positive(
 
     vmax = max(float(vmax), 1.0e-6)
 
-    rendered = ax.imshow(
+    rendered = axis.imshow(
         image.T,
         origin="lower",
         extent=[
@@ -134,23 +171,29 @@ def show_positive(
         ),
     )
 
-    ax.set_title(title, fontsize=9)
-    ax.set_xlabel(r"$\Delta\eta$")
-    ax.set_ylabel(r"$\Delta\phi$")
-    fig.colorbar(rendered, ax=ax, fraction=0.046, pad=0.04)
+    axis.set_title(title, fontsize=9)
+    axis.set_xlabel(r"$\Delta\eta$")
+    axis.set_ylabel(r"$\Delta\phi$")
+    fig.colorbar(
+        rendered,
+        ax=axis,
+        fraction=0.046,
+        pad=0.04,
+        label=r"$p_T$ [GeV]",
+    )
 
 
 def show_residual(
     fig,
-    ax,
+    axis,
     residual: np.ndarray,
     title: str,
+    max_abs: float,
 ) -> None:
-    """Display a signed prediction residual."""
-    max_abs = float(np.nanmax(np.abs(residual)))
-    max_abs = max(max_abs, 1.0e-6)
+    """Display a signed prediction-minus-truth residual."""
+    max_abs = max(float(max_abs), 1.0e-6)
 
-    rendered = ax.imshow(
+    rendered = axis.imshow(
         residual.T,
         origin="lower",
         extent=[
@@ -168,35 +211,52 @@ def show_residual(
         ),
     )
 
-    ax.set_title(title, fontsize=9)
-    ax.set_xlabel(r"$\Delta\eta$")
-    ax.set_ylabel(r"$\Delta\phi$")
-    fig.colorbar(rendered, ax=ax, fraction=0.046, pad=0.04)
+    axis.set_title(title, fontsize=9)
+    axis.set_xlabel(r"$\Delta\eta$")
+    axis.set_ylabel(r"$\Delta\phi$")
+    fig.colorbar(
+        rendered,
+        ax=axis,
+        fraction=0.046,
+        pad=0.04,
+        label=r"$\Delta p_T$ [GeV]",
+    )
 
 
-def save_panel(
+def save_comparison_panel(
     output_path: Path,
     neutral_all: np.ndarray,
     charged_pu: np.ndarray,
     charged_lv: np.ndarray,
     truth: np.ndarray,
-    prediction: np.ndarray,
+    single_prediction: np.ndarray,
+    mean_prediction: np.ndarray,
     title: str,
+    eval_samples: int,
     dpi: int,
 ) -> None:
-    residual = prediction - truth
+    """Save one 2x4 same-event comparison panel."""
+    single_residual = single_prediction - truth
+    mean_residual = mean_prediction - truth
 
     neutral_vmax = max(
         float(np.nanmax(neutral_all)),
         float(np.nanmax(truth)),
-        float(np.nanmax(prediction)),
+        float(np.nanmax(single_prediction)),
+        float(np.nanmax(mean_prediction)),
+        1.0e-6,
+    )
+
+    residual_max_abs = max(
+        float(np.nanmax(np.abs(single_residual))),
+        float(np.nanmax(np.abs(mean_residual))),
         1.0e-6,
     )
 
     fig, axes = plt.subplots(
         2,
-        3,
-        figsize=(15, 9),
+        4,
+        figsize=(20, 9.5),
         constrained_layout=True,
     )
 
@@ -221,37 +281,382 @@ def save_panel(
     )
     show_positive(
         fig,
-        axes[1, 0],
+        axes[0, 3],
         truth,
         "True neutral LV (9x9)",
         neutral_vmax,
     )
     show_positive(
         fig,
-        axes[1, 1],
-        prediction,
-        "PileFlow neutral LV (9x9)",
+        axes[1, 0],
+        single_prediction,
+        "Single PileFlow sample (sample 1)",
         neutral_vmax,
     )
     show_residual(
         fig,
+        axes[1, 1],
+        single_residual,
+        "Single minus truth",
+        residual_max_abs,
+    )
+    show_positive(
+        fig,
         axes[1, 2],
-        residual,
-        "PileFlow minus truth (9x9)",
+        mean_prediction,
+        f"PileFlow mean of N={eval_samples} samples",
+        neutral_vmax,
+    )
+    show_residual(
+        fig,
+        axes[1, 3],
+        mean_residual,
+        "Mean minus truth",
+        residual_max_abs,
     )
 
-    fig.suptitle(title, fontsize=12)
-    fig.savefig(output_path, dpi=dpi)
+    fig.suptitle(
+        title,
+        fontsize=11,
+    )
+    fig.savefig(
+        output_path,
+        dpi=dpi,
+        bbox_inches="tight",
+    )
     plt.close(fig)
+
+
+def format_metadata(
+    index: int,
+    selection_label: str,
+    selection_rank: int | None,
+    jet_pt: np.ndarray | None,
+    n_pu: np.ndarray | None,
+    eval_samples: int,
+    truth_total: np.ndarray,
+    single_total: np.ndarray,
+    mean_total: np.ndarray,
+    single_mae: np.ndarray,
+    mean_mae: np.ndarray,
+) -> str:
+    """Build a two-line title for one jet."""
+    pt_text = (
+        f"{jet_pt[index]:.1f} GeV"
+        if jet_pt is not None
+        else "unknown"
+    )
+    npu_text = (
+        f"{n_pu[index]:.0f}"
+        if n_pu is not None
+        else "unknown"
+    )
+    rank_text = (
+        f" | selection rank {selection_rank}"
+        if selection_rank is not None
+        else ""
+    )
+
+    return (
+        f"Jet {index} | {selection_label}{rank_text} | "
+        f"jet pT={pt_text} | NPU={npu_text} | N={eval_samples}\n"
+        f"truth neutral pT={truth_total[index]:.2f} GeV | "
+        f"single={single_total[index]:.2f} GeV "
+        f"(MAE={single_mae[index]:.4f} GeV) | "
+        f"mean={mean_total[index]:.2f} GeV "
+        f"(MAE={mean_mae[index]:.4f} GeV)"
+    )
+
+
+def write_metrics_csv(
+    output_path: Path,
+    n_jets: int,
+    jet_pt: np.ndarray | None,
+    n_pu: np.ndarray | None,
+    neutral_all_total: np.ndarray,
+    truth_total: np.ndarray,
+    single_total: np.ndarray,
+    mean_total: np.ndarray,
+    single_total_error: np.ndarray,
+    mean_total_error: np.ndarray,
+    single_mae: np.ndarray,
+    mean_mae: np.ndarray,
+    single_rmse: np.ndarray,
+    mean_rmse: np.ndarray,
+) -> None:
+    """Write per-jet diagnostics for both prediction modes."""
+    with output_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow([
+            "jet_index",
+            "jet_pt",
+            "n_pu",
+            "neutral_all_total",
+            "truth_neutral_lv_total",
+            "single_neutral_lv_total",
+            "mean_neutral_lv_total",
+            "single_minus_truth_total",
+            "mean_minus_truth_total",
+            "single_abs_total_pt_error",
+            "mean_abs_total_pt_error",
+            "single_pixel_mae",
+            "mean_pixel_mae",
+            "single_pixel_rmse",
+            "mean_pixel_rmse",
+        ])
+
+        for index in range(n_jets):
+            writer.writerow([
+                index,
+                (
+                    float(jet_pt[index])
+                    if jet_pt is not None
+                    else ""
+                ),
+                (
+                    float(n_pu[index])
+                    if n_pu is not None
+                    else ""
+                ),
+                float(neutral_all_total[index]),
+                float(truth_total[index]),
+                float(single_total[index]),
+                float(mean_total[index]),
+                float(single_total_error[index]),
+                float(mean_total_error[index]),
+                float(abs(single_total_error[index])),
+                float(abs(mean_total_error[index])),
+                float(single_mae[index]),
+                float(mean_mae[index]),
+                float(single_rmse[index]),
+                float(mean_rmse[index]),
+            ])
+
+
+def save_selection_folder(
+    root_dir: Path,
+    folder_name: str,
+    ordering: np.ndarray,
+    count: int,
+    selection_label: str,
+    neutral_all: np.ndarray,
+    charged_pu: np.ndarray,
+    charged_lv: np.ndarray,
+    truth: np.ndarray,
+    single_prediction: np.ndarray,
+    mean_prediction: np.ndarray,
+    jet_pt: np.ndarray | None,
+    n_pu: np.ndarray | None,
+    eval_samples: int,
+    truth_total: np.ndarray,
+    single_total: np.ndarray,
+    mean_total: np.ndarray,
+    single_mae: np.ndarray,
+    mean_mae: np.ndarray,
+    dpi: int,
+) -> None:
+    """Save M selected events using the common 2x4 layout."""
+    folder = root_dir / folder_name
+    folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    selected = ordering[:count]
+    summary_path = folder / "selected_jets.csv"
+
+    with summary_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "selection_rank",
+            "jet_index",
+            "single_pixel_mae",
+            "mean_pixel_mae",
+            "single_abs_total_pt_error",
+            "mean_abs_total_pt_error",
+        ])
+
+        for rank, raw_index in enumerate(selected, start=1):
+            index = int(raw_index)
+
+            writer.writerow([
+                rank,
+                index,
+                float(single_mae[index]),
+                float(mean_mae[index]),
+                float(abs(single_total[index] - truth_total[index])),
+                float(abs(mean_total[index] - truth_total[index])),
+            ])
+
+            title = format_metadata(
+                index=index,
+                selection_label=selection_label,
+                selection_rank=rank,
+                jet_pt=jet_pt,
+                n_pu=n_pu,
+                eval_samples=eval_samples,
+                truth_total=truth_total,
+                single_total=single_total,
+                mean_total=mean_total,
+                single_mae=single_mae,
+                mean_mae=mean_mae,
+            )
+
+            save_comparison_panel(
+                output_path=(
+                    folder
+                    / f"rank_{rank:03d}_jet_{index:06d}.png"
+                ),
+                neutral_all=neutral_all[index],
+                charged_pu=charged_pu[index],
+                charged_lv=charged_lv[index],
+                truth=truth[index],
+                single_prediction=single_prediction[index],
+                mean_prediction=mean_prediction[index],
+                title=title,
+                eval_samples=eval_samples,
+                dpi=dpi,
+            )
+
+
+def save_paired_extremes(
+    root_dir: Path,
+    neutral_all: np.ndarray,
+    charged_pu: np.ndarray,
+    charged_lv: np.ndarray,
+    truth: np.ndarray,
+    single_prediction: np.ndarray,
+    mean_prediction: np.ndarray,
+    jet_pt: np.ndarray | None,
+    n_pu: np.ndarray | None,
+    eval_samples: int,
+    truth_total: np.ndarray,
+    single_total: np.ndarray,
+    mean_total: np.ndarray,
+    single_mae: np.ndarray,
+    mean_mae: np.ndarray,
+    dpi: int,
+) -> None:
+    """
+    Save exactly four same-event comparisons.
+
+    Single and mean extrema are both defined by pixel MAE so that this paired
+    comparison uses the same performance criterion for both prediction modes.
+    """
+    folder = root_dir / "paired_extremes"
+    folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    cases = [
+        (
+            "01_best_single_event",
+            int(np.argmin(single_mae)),
+            "Best single-sample MAE event",
+        ),
+        (
+            "02_best_mean_event",
+            int(np.argmin(mean_mae)),
+            "Best N-sample-mean MAE event",
+        ),
+        (
+            "03_worst_single_event",
+            int(np.argmax(single_mae)),
+            "Worst single-sample MAE event",
+        ),
+        (
+            "04_worst_mean_event",
+            int(np.argmax(mean_mae)),
+            "Worst N-sample-mean MAE event",
+        ),
+    ]
+
+    summary_path = folder / "paired_extremes.csv"
+
+    with summary_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "case",
+            "jet_index",
+            "single_pixel_mae",
+            "mean_pixel_mae",
+            "single_abs_total_pt_error",
+            "mean_abs_total_pt_error",
+        ])
+
+        for file_prefix, index, label in cases:
+            writer.writerow([
+                label,
+                index,
+                float(single_mae[index]),
+                float(mean_mae[index]),
+                float(abs(single_total[index] - truth_total[index])),
+                float(abs(mean_total[index] - truth_total[index])),
+            ])
+
+            title = format_metadata(
+                index=index,
+                selection_label=label,
+                selection_rank=None,
+                jet_pt=jet_pt,
+                n_pu=n_pu,
+                eval_samples=eval_samples,
+                truth_total=truth_total,
+                single_total=single_total,
+                mean_total=mean_total,
+                single_mae=single_mae,
+                mean_mae=mean_mae,
+            )
+
+            save_comparison_panel(
+                output_path=(
+                    folder
+                    / f"{file_prefix}_jet_{index:06d}.png"
+                ),
+                neutral_all=neutral_all[index],
+                charged_pu=charged_pu[index],
+                charged_lv=charged_lv[index],
+                truth=truth[index],
+                single_prediction=single_prediction[index],
+                mean_prediction=mean_prediction[index],
+                title=title,
+                eval_samples=eval_samples,
+                dpi=dpi,
+            )
 
 
 def main() -> None:
     args = parse_args()
 
-    output_dir = Path(args.outdir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.max_jets < 0:
+        raise ValueError(
+            f"--max-jets must be nonnegative, got {args.max_jets}"
+        )
 
-    with np.load(args.input_npz, allow_pickle=False) as source:
+    output_dir = Path(args.outdir)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with np.load(
+        args.input_npz,
+        allow_pickle=False,
+    ) as source:
         neutral_all = image_batch(
             source["ch_neutral_all_raw"],
             (9, 9),
@@ -274,21 +679,52 @@ def main() -> None:
         )
 
         jet_pt = (
-            np.asarray(source["jet_pt"], dtype=np.float32)
+            np.asarray(
+                source["jet_pt"],
+                dtype=np.float32,
+            )
             if "jet_pt" in source.files
             else None
         )
         n_pu = (
-            np.asarray(source["n_pu"], dtype=np.float32)
+            np.asarray(
+                source["n_pu"],
+                dtype=np.float32,
+            )
             if "n_pu" in source.files
             else None
         )
 
-    with np.load(args.generated_npz, allow_pickle=False) as generated:
-        prediction = image_batch(
-            generated["neutral_lv_pred"],
+    with np.load(
+        args.generated_npz,
+        allow_pickle=False,
+    ) as generated:
+        required_prediction_keys = [
+            "neutral_lv_pred_single",
+            "neutral_lv_pred_mean",
+        ]
+        missing = [
+            key
+            for key in required_prediction_keys
+            if key not in generated.files
+        ]
+
+        if missing:
+            raise KeyError(
+                "The generated NPZ does not contain the new single/mean "
+                f"prediction keys: {missing}. Rerun PileFlow generation "
+                "after updating flows/training/train_flow.py."
+            )
+
+        single_prediction = image_batch(
+            generated["neutral_lv_pred_single"],
             (9, 9),
-            "neutral_lv_pred",
+            "neutral_lv_pred_single",
+        )
+        mean_prediction = image_batch(
+            generated["neutral_lv_pred_mean"],
+            (9, 9),
+            "neutral_lv_pred_mean",
         )
 
         if "neutral_lv_true" in generated.files:
@@ -300,146 +736,238 @@ def main() -> None:
         else:
             truth = source_truth
 
-    n_jets = min(
-        len(neutral_all),
-        len(charged_pu),
-        len(charged_lv),
-        len(truth),
-        len(prediction),
+        eval_samples = (
+            int(
+                np.asarray(
+                    generated["eval_samples"]
+                ).reshape(()).item()
+            )
+            if "eval_samples" in generated.files
+            else 1
+        )
+
+        if "neutral_lv_pred" in generated.files:
+            compatibility_prediction = image_batch(
+                generated["neutral_lv_pred"],
+                (9, 9),
+                "neutral_lv_pred",
+            )
+
+            if not np.array_equal(
+                compatibility_prediction,
+                mean_prediction,
+            ):
+                raise ValueError(
+                    "neutral_lv_pred is not identical to "
+                    "neutral_lv_pred_mean."
+                )
+
+    aligned = {
+        "neutral_all": neutral_all,
+        "charged_pu": charged_pu,
+        "charged_lv": charged_lv,
+        "truth": truth,
+        "single_prediction": single_prediction,
+        "mean_prediction": mean_prediction,
+    }
+
+    n_jets = require_equal_rows(
+        aligned
     )
 
-    neutral_all = neutral_all[:n_jets]
-    charged_pu = charged_pu[:n_jets]
-    charged_lv = charged_lv[:n_jets]
-    truth = truth[:n_jets]
-    prediction = prediction[:n_jets]
+    if jet_pt is not None and len(jet_pt) != n_jets:
+        raise ValueError(
+            f"jet_pt has {len(jet_pt)} rows; expected {n_jets}."
+        )
 
-    if jet_pt is not None:
-        jet_pt = jet_pt[:n_jets]
+    if n_pu is not None and len(n_pu) != n_jets:
+        raise ValueError(
+            f"n_pu has {len(n_pu)} rows; expected {n_jets}."
+        )
 
-    if n_pu is not None:
-        n_pu = n_pu[:n_jets]
+    if eval_samples <= 0:
+        raise ValueError(
+            f"Saved eval_samples must be positive, got {eval_samples}."
+        )
 
-    difference = prediction - truth
+    single_difference = (
+        single_prediction - truth
+    )
+    mean_difference = (
+        mean_prediction - truth
+    )
 
-    pixel_mae = np.mean(
-        np.abs(difference),
+    single_mae = np.mean(
+        np.abs(single_difference),
         axis=(1, 2),
     )
-    pixel_rmse = np.sqrt(
+    mean_mae = np.mean(
+        np.abs(mean_difference),
+        axis=(1, 2),
+    )
+
+    single_rmse = np.sqrt(
         np.mean(
-            difference**2,
+            single_difference**2,
+            axis=(1, 2),
+        )
+    )
+    mean_rmse = np.sqrt(
+        np.mean(
+            mean_difference**2,
             axis=(1, 2),
         )
     )
 
-    truth_total = truth.sum(axis=(1, 2))
-    prediction_total = prediction.sum(axis=(1, 2))
-    neutral_all_total = neutral_all.sum(axis=(1, 2))
-    total_pt_error = prediction_total - truth_total
+    truth_total = truth.sum(
+        axis=(1, 2)
+    )
+    single_total = single_prediction.sum(
+        axis=(1, 2)
+    )
+    mean_total = mean_prediction.sum(
+        axis=(1, 2)
+    )
+    neutral_all_total = neutral_all.sum(
+        axis=(1, 2)
+    )
 
-    metrics_path = output_dir / "jet_metrics.csv"
+    single_total_error = (
+        single_total - truth_total
+    )
+    mean_total_error = (
+        mean_total - truth_total
+    )
 
-    with metrics_path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
+    metrics_path = (
+        output_dir / "jet_metrics.csv"
+    )
 
-        writer.writerow([
-            "jet_index",
-            "jet_pt",
-            "n_pu",
-            "neutral_all_total",
-            "truth_neutral_lv_total",
-            "prediction_neutral_lv_total",
-            "prediction_minus_truth_total",
-            "pixel_mae",
-            "pixel_rmse",
-        ])
+    write_metrics_csv(
+        output_path=metrics_path,
+        n_jets=n_jets,
+        jet_pt=jet_pt,
+        n_pu=n_pu,
+        neutral_all_total=neutral_all_total,
+        truth_total=truth_total,
+        single_total=single_total,
+        mean_total=mean_total,
+        single_total_error=single_total_error,
+        mean_total_error=mean_total_error,
+        single_mae=single_mae,
+        mean_mae=mean_mae,
+        single_rmse=single_rmse,
+        mean_rmse=mean_rmse,
+    )
 
-        for index in range(n_jets):
-            writer.writerow([
-                index,
-                (
-                    float(jet_pt[index])
-                    if jet_pt is not None
-                    else ""
-                ),
-                (
-                    float(n_pu[index])
-                    if n_pu is not None
-                    else ""
-                ),
-                float(neutral_all_total[index]),
-                float(truth_total[index]),
-                float(prediction_total[index]),
-                float(total_pt_error[index]),
-                float(pixel_mae[index]),
-                float(pixel_rmse[index]),
-            ])
+    count = min(
+        args.max_jets,
+        n_jets,
+    )
 
-    if args.selection == "first":
-        ordering = np.arange(n_jets)
-    elif args.selection == "worst-mae":
-        ordering = np.argsort(pixel_mae)[::-1]
-    elif args.selection == "best-mae":
-        ordering = np.argsort(pixel_mae)
-    else:
-        ordering = np.argsort(np.abs(total_pt_error))[::-1]
+    selections = [
+        (
+            "single_best_mae",
+            np.argsort(single_mae),
+            "Selected by lowest single-sample pixel MAE",
+        ),
+        (
+            "single_worst_mae",
+            np.argsort(single_mae)[::-1],
+            "Selected by highest single-sample pixel MAE",
+        ),
+        (
+            "mean_best_total_pt",
+            np.argsort(
+                np.abs(mean_total_error)
+            ),
+            "Selected by lowest mean absolute total-pT error",
+        ),
+        (
+            "mean_worst_total_pt",
+            np.argsort(
+                np.abs(mean_total_error)
+            )[::-1],
+            "Selected by highest mean absolute total-pT error",
+        ),
+    ]
 
-    count = min(max(args.max_jets, 0), n_jets)
-    selected = ordering[:count]
-
-    panels_dir = output_dir / "panels"
-    panels_dir.mkdir(parents=True, exist_ok=True)
-
-    for rank, index in enumerate(selected):
-        pt_text = (
-            f"{jet_pt[index]:.1f} GeV"
-            if jet_pt is not None
-            else "unknown"
-        )
-
-        npu_text = (
-            f"{n_pu[index]:.0f}"
-            if n_pu is not None
-            else "unknown"
-        )
-
-        title = (
-            f"Jet {index} | selection rank {rank + 1} | "
-            f"jet pT={pt_text} | NPU={npu_text} | "
-            f"truth neutral pT={truth_total[index]:.2f} GeV | "
-            f"PileFlow={prediction_total[index]:.2f} GeV | "
-            f"pixel MAE={pixel_mae[index]:.4f} GeV"
-        )
-
-        save_panel(
-            output_path=panels_dir / f"jet_{index:06d}.png",
-            neutral_all=neutral_all[index],
-            charged_pu=charged_pu[index],
-            charged_lv=charged_lv[index],
-            truth=truth[index],
-            prediction=prediction[index],
-            title=title,
+    for folder_name, ordering, label in selections:
+        save_selection_folder(
+            root_dir=output_dir,
+            folder_name=folder_name,
+            ordering=ordering,
+            count=count,
+            selection_label=label,
+            neutral_all=neutral_all,
+            charged_pu=charged_pu,
+            charged_lv=charged_lv,
+            truth=truth,
+            single_prediction=single_prediction,
+            mean_prediction=mean_prediction,
+            jet_pt=jet_pt,
+            n_pu=n_pu,
+            eval_samples=eval_samples,
+            truth_total=truth_total,
+            single_total=single_total,
+            mean_total=mean_total,
+            single_mae=single_mae,
+            mean_mae=mean_mae,
             dpi=args.dpi,
         )
 
-    save_panel(
-        output_path=output_dir / "mean_panel.png",
+    save_paired_extremes(
+        root_dir=output_dir,
+        neutral_all=neutral_all,
+        charged_pu=charged_pu,
+        charged_lv=charged_lv,
+        truth=truth,
+        single_prediction=single_prediction,
+        mean_prediction=mean_prediction,
+        jet_pt=jet_pt,
+        n_pu=n_pu,
+        eval_samples=eval_samples,
+        truth_total=truth_total,
+        single_total=single_total,
+        mean_total=mean_total,
+        single_mae=single_mae,
+        mean_mae=mean_mae,
+        dpi=args.dpi,
+    )
+
+    save_comparison_panel(
+        output_path=(
+            output_dir / "mean_panel.png"
+        ),
         neutral_all=neutral_all.mean(axis=0),
         charged_pu=charged_pu.mean(axis=0),
         charged_lv=charged_lv.mean(axis=0),
         truth=truth.mean(axis=0),
-        prediction=prediction.mean(axis=0),
-        title=f"Mean images over {n_jets:,} evaluation jets",
+        single_prediction=single_prediction.mean(axis=0),
+        mean_prediction=mean_prediction.mean(axis=0),
+        title=(
+            f"Mean images over {n_jets:,} evaluation jets | "
+            f"N={eval_samples}"
+        ),
+        eval_samples=eval_samples,
         dpi=args.dpi,
     )
 
-    print(f"Evaluation jets : {n_jets:,}")
-    print(f"Panels saved    : {count:,}")
-    print(f"Selection       : {args.selection}")
-    print(f"Metrics CSV     : {metrics_path}")
-    print(f"Mean panel      : {output_dir / 'mean_panel.png'}")
-    print(f"Individual PNGs : {panels_dir}")
+    print(f"Evaluation jets        : {n_jets:,}")
+    print(f"Samples in mean (N)    : {eval_samples}")
+    print(f"Panels per main folder : {count}")
+    print(f"Metrics CSV            : {metrics_path}")
+    print(f"Mean panel             : {output_dir / 'mean_panel.png'}")
+    print("Main folders:")
+    print(f"  {output_dir / 'single_best_mae'}")
+    print(f"  {output_dir / 'single_worst_mae'}")
+    print(f"  {output_dir / 'mean_best_total_pt'}")
+    print(f"  {output_dir / 'mean_worst_total_pt'}")
+    print(
+        "Paired comparisons     : "
+        f"{output_dir / 'paired_extremes'} "
+        "(exactly 4 PNGs)"
+    )
 
 
 if __name__ == "__main__":
