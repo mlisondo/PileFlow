@@ -8,15 +8,26 @@ This module consumes generator image outputs through:
 
     flows.data.dataset.PileFlowDataset
 
-PileFlow conditions only on three flattened image channels:
+PileFlow conditions on the original flattened image channels plus learned
+same-resolution local CNN descriptors.
+
+Raw image context:
 
     81    contaminated neutral image, 9x9
     1296  charged-pileup image, 36x36
     1296  charged-LV image, 36x36
 
+Learned local CNN context:
+
+    81    contaminated-neutral local map, 9x9
+    1296  charged-pileup local map, 36x36
+    1296  charged-LV local map, 36x36
+
 Total context dimension:
 
-    81 + 1296 + 1296 = 2673
+    2673 raw + 2673 local = 5346
+
+The CNN branches use no pooling, striding, or downsampling.
 
 The flow generates only:
 
@@ -53,17 +64,19 @@ from ..models.pileflow import (
     CHARGED_SIDE,
     CRTVelocityField,
     ContextEncoder,
+    LOCAL_CONTEXT_DIM,
     NEUTRAL_DIM,
     NEUTRAL_SIDE,
     N_CONTEXT,
     N_IMAGES,
     N_SCALARS,
     N_TARGET,
+    RAW_CONTEXT_DIM,
     TargetCFM,
     TargetPreprocessor,
 )
 
-FLOW_CONTRACT = "image-only-neutral9-charged36-v1"
+FLOW_CONTRACT = "image-only-neutral9-charged36-localcnn-prenorm-v3"
 
 
 def _load_checkpoint(path: str, device: torch.device) -> dict[str, Any]:
@@ -78,17 +91,33 @@ def _validate_checkpoint_contract(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Confirm that a checkpoint uses the mixed-resolution 2673-to-81 contract.
+    Confirm that a checkpoint uses the raw-plus-local CNN context contract.
 
-    Previous PileFlow checkpoints using either the legacy 253-context,
-    97-target contract or the image-only 243-context, 81-target contract
-    cannot be loaded by this model.
+    The new model uses:
+
+        raw context   = 2673
+        local context = 2673
+        total context = 5346
+        target        = 81
+
+    Older PileFlow checkpoints are intentionally incompatible.
     """
     saved_cfg = state.get("cfg")
 
     if not isinstance(saved_cfg, dict):
         raise ValueError(
-            "PileFlow checkpoint does not contain valid configuration metadata."
+            "PileFlow checkpoint does not contain valid "
+            "configuration metadata."
+        )
+
+    saved_contract = state.get("contract")
+
+    if saved_contract != FLOW_CONTRACT:
+        raise ValueError(
+            "Checkpoint contract mismatch.\n"
+            f"Expected: {FLOW_CONTRACT!r}\n"
+            f"Found:    {saved_contract!r}\n"
+            "The local-CNN architecture requires a newly trained checkpoint."
         )
 
     expected = {
@@ -97,6 +126,10 @@ def _validate_checkpoint_contract(
         "n_scalars": N_SCALARS,
         "neutral_dim": NEUTRAL_DIM,
         "charged_dim": CHARGED_DIM,
+        "raw_context_dim": RAW_CONTEXT_DIM,
+        "local_context_dim": LOCAL_CONTEXT_DIM,
+        "context_mode": "raw-plus-full-resolution-local-cnn",
+        "residual_normalization": "pre-layernorm",
     }
 
     actual = {
@@ -105,22 +138,45 @@ def _validate_checkpoint_contract(
         "n_scalars": saved_cfg.get("n_scalars"),
         "neutral_dim": saved_cfg.get("neutral_dim"),
         "charged_dim": saved_cfg.get("charged_dim"),
+        "raw_context_dim": saved_cfg.get("raw_context_dim"),
+        "local_context_dim": saved_cfg.get("local_context_dim"),
+        "context_mode": saved_cfg.get("context_mode"),
+        "residual_normalization": saved_cfg.get("residual_normalization"),
     }
 
     if actual != expected:
         raise ValueError(
-            "Checkpoint is incompatible with mixed-resolution PileFlow.\n"
+            "Checkpoint is incompatible with local-CNN PileFlow.\n"
             f"Expected: {expected}\n"
             f"Found:    {actual}\n"
-            "Older 253-to-97 and 243-to-81 checkpoints must be retrained."
+            "Older 253-, 243-, and 2673-context checkpoints must "
+            "not be loaded into this architecture."
         )
 
-    saved_contract = state.get("contract")
+    local_hidden_channels = saved_cfg.get(
+        "local_cnn_hidden_channels"
+    )
 
-    if saved_contract is not None and saved_contract != FLOW_CONTRACT:
+    if (
+        not isinstance(local_hidden_channels, int)
+        or local_hidden_channels <= 0
+    ):
         raise ValueError(
-            "Checkpoint contract mismatch: "
-            f"expected {FLOW_CONTRACT!r}, found {saved_contract!r}."
+            "Checkpoint contains an invalid local-CNN hidden-channel "
+            f"count: {local_hidden_channels!r}"
+        )
+
+    local_negative_slope = saved_cfg.get(
+        "local_cnn_negative_slope"
+    )
+
+    if (
+        not isinstance(local_negative_slope, (int, float))
+        or not 0.0 < float(local_negative_slope) < 1.0
+    ):
+        raise ValueError(
+            "Checkpoint contains an invalid local-CNN LeakyReLU "
+            f"negative slope: {local_negative_slope!r}"
         )
 
     return saved_cfg
@@ -166,41 +222,102 @@ def _checkpoint_payload(
     cfg,
     dropout: float,
 ) -> dict[str, Any]:
-    """Build the checkpoint payload saved during training."""
+    """
+    Build the local-CNN PileFlow checkpoint payload.
+
+    The checkpoint stores both:
+        - velocity-field parameters;
+        - trainable context-CNN parameters and normalization buffers.
+    """
+    local_hidden_channels = int(
+        getattr(
+            cfg,
+            "flow_local_hidden",
+            8,
+        )
+    )
+
+    local_negative_slope = float(
+        getattr(
+            cfg,
+            "flow_local_negative_slope",
+            0.1,
+        )
+    )
+
     return {
         "contract": FLOW_CONTRACT,
         "model": model.state_dict(),
         "ctx_enc": ctx_enc.state_dict(),
         "tgt_prep": tgt_prep.state_dict(),
         "cfg": {
+            # Input/output dimensions.
             "n_context": N_CONTEXT,
+            "raw_context_dim": RAW_CONTEXT_DIM,
+            "local_context_dim": LOCAL_CONTEXT_DIM,
             "n_target": N_TARGET,
             "n_images": N_IMAGES,
             "n_scalars": N_SCALARS,
             "n_img": NEUTRAL_DIM,
+
+            # Image geometry.
             "neutral_side": NEUTRAL_SIDE,
             "neutral_dim": NEUTRAL_DIM,
             "charged_side": CHARGED_SIDE,
             "charged_dim": CHARGED_DIM,
+
+            # Context architecture.
+            "context_mode": "raw-plus-full-resolution-local-cnn",
+            "local_cnn_hidden_channels": local_hidden_channels,
+            "local_cnn_output_channels": 1,
+            "local_cnn_activation": "leaky_relu",
+            "local_cnn_negative_slope": local_negative_slope,
+            "local_cnn_kernel_sizes": [3, 3, 1],
+            "local_cnn_downsampling": False,
+
+            # Data-channel contract.
             "channel_order": [
                 "ch_neutral_all_raw",
                 "ch_charged_pu",
                 "ch_charged_lv",
             ],
             "channel_shapes": {
-                "ch_neutral_all_raw": [NEUTRAL_SIDE, NEUTRAL_SIDE],
-                "ch_charged_pu": [CHARGED_SIDE, CHARGED_SIDE],
-                "ch_charged_lv": [CHARGED_SIDE, CHARGED_SIDE],
+                "ch_neutral_all_raw": [
+                    NEUTRAL_SIDE,
+                    NEUTRAL_SIDE,
+                ],
+                "ch_charged_pu": [
+                    CHARGED_SIDE,
+                    CHARGED_SIDE,
+                ],
+                "ch_charged_lv": [
+                    CHARGED_SIDE,
+                    CHARGED_SIDE,
+                ],
             },
+
+            # Target contract.
             "target_key": "ch_neutral_lv",
-            "target_shape": [NEUTRAL_SIDE, NEUTRAL_SIDE],
+            "target_shape": [
+                NEUTRAL_SIDE,
+                NEUTRAL_SIDE,
+            ],
+
+            # Velocity-field architecture.
             "flow_hidden": cfg.flow_hidden,
             "flow_blocks": cfg.flow_blocks,
             "flow_time_emb": cfg.flow_time_emb,
             "flow_sigma_min": cfg.flow_sigma_min,
             "flow_dropout": dropout,
+            "residual_normalization": "pre-layernorm",
+            "residual_update": "h-plus-F-layernorm-h-cond",
+            "final_hidden_normalization": False,
+
+            # Decoding.
             "pt_threshold": None,
-            "decode_postprocessing": "clamp-nonnegative-no-threshold",
+            "decode_postprocessing": (
+                "clamp-nonnegative-no-threshold"
+            ),
         },
     }
 
@@ -279,9 +396,27 @@ def train_pileflow(
     charged_lv_train = dataset.charged_lv_36x36[train_indices]
     neutral_lv_train = dataset.neutral_lv[train_indices]
 
+    local_hidden_channels = int(
+        getattr(
+            cfg,
+            "flow_local_hidden",
+            8,
+        )
+    )
+
+    local_negative_slope = float(
+        getattr(
+            cfg,
+            "flow_local_negative_slope",
+            0.1,
+        )
+    )
+
     ctx_enc = ContextEncoder(
         neutral_dim=NEUTRAL_DIM,
         charged_dim=CHARGED_DIM,
+        local_hidden_channels=local_hidden_channels,
+        local_negative_slope=local_negative_slope,
     )
 
     tgt_prep = TargetPreprocessor(n_img=N_TARGET)
@@ -321,8 +456,14 @@ def train_pileflow(
 
     cfm = TargetCFM(sigma_min=cfg.flow_sigma_min)
 
+    # Both the velocity field and the three local CNN branches must be trained.
+    trainable_parameters = (
+        list(model.parameters())
+        + list(ctx_enc.parameters())
+    )
+
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        trainable_parameters,
         lr=cfg.flow_lr,
         weight_decay=1e-4,
     )
@@ -332,20 +473,64 @@ def train_pileflow(
         T_max=cfg.flow_epochs,
     )
 
-    print(f"  [flow] Parameters : {model.count_parameters():,}")
+    velocity_parameters = model.count_parameters()
+    encoder_parameters = ctx_enc.count_parameters()
+    total_parameters = (
+        velocity_parameters
+        + encoder_parameters
+    )
+
     print(
-        f"  [flow] Context dim: {N_CONTEXT} "
-        f"({NEUTRAL_DIM} neutral + {CHARGED_DIM} charged-PU + "
-        f"{CHARGED_DIM} charged-LV)"
+        f"  [flow] Velocity parameters : "
+        f"{velocity_parameters:,}"
     )
     print(
-        f"  [flow] Target  dim: {N_TARGET} "
+        f"  [flow] CNN parameters      : "
+        f"{encoder_parameters:,}"
+    )
+    print(
+        f"  [flow] Total parameters    : "
+        f"{total_parameters:,}"
+    )
+
+    print(
+        f"  [flow] Raw context dim     : "
+        f"{RAW_CONTEXT_DIM}"
+    )
+    print(
+        f"  [flow] Local context dim   : "
+        f"{LOCAL_CONTEXT_DIM}"
+    )
+    print(
+        f"  [flow] Total context dim   : "
+        f"{N_CONTEXT}"
+    )
+
+    print(
+        "  [flow] Local CNN          : "
+        f"3x3 -> 3x3 -> 1x1, "
+        f"{local_hidden_channels} hidden channels"
+    )
+    print(
+        "  [flow] CNN activation     : "
+        f"LeakyReLU({local_negative_slope})"
+    )
+    print(
+        "  [flow] CNN downsampling   : none"
+    )
+
+    print(
+        f"  [flow] Target dim          : "
+        f"{N_TARGET} "
         f"({NEUTRAL_SIDE}x{NEUTRAL_SIDE} neutral-LV pixels)"
     )
+
     print(
-        f"  [flow] Architecture: {cfg.flow_blocks} blocks x "
+        f"  [flow] Dense architecture  : "
+        f"{cfg.flow_blocks} blocks x "
         f"{cfg.flow_hidden} hidden"
     )
+
     print()
 
     best_val = float("inf")
@@ -362,6 +547,8 @@ def train_pileflow(
         start = time.time()
 
         model.train()
+        ctx_enc.train()
+
         train_loss = 0.0
 
         for batch in train_loader:
@@ -394,7 +581,7 @@ def train_pileflow(
             loss.backward()
 
             nn.utils.clip_grad_norm_(
-                model.parameters(),
+                trainable_parameters,
                 1.0,
             )
 
@@ -404,6 +591,8 @@ def train_pileflow(
         train_loss /= len(train_loader)
 
         model.eval()
+        ctx_enc.eval()
+
         val_loss = 0.0
 
         with torch.no_grad():
@@ -495,9 +684,25 @@ def train_pileflow(
 
     print(f"  [flow] Best val  : {best_val:.6f}  ->  {flow_ckpt}")
 
-    state = _load_checkpoint(flow_ckpt, device)
-    _validate_checkpoint_contract(state)
-    model.load_state_dict(state["model"])
+    state = _load_checkpoint(
+        flow_ckpt,
+        device,
+    )
+
+    _validate_checkpoint_contract(
+        state
+    )
+
+    model.load_state_dict(
+        state["model"]
+    )
+
+    ctx_enc.load_state_dict(
+        state["ctx_enc"]
+    )
+
+    model.eval()
+    ctx_enc.eval()
 
     return model
 
@@ -594,6 +799,12 @@ def generate_and_save(
     ctx_enc = ContextEncoder(
         neutral_dim=saved_cfg["neutral_dim"],
         charged_dim=saved_cfg["charged_dim"],
+        local_hidden_channels=saved_cfg[
+            "local_cnn_hidden_channels"
+        ],
+        local_negative_slope=saved_cfg[
+            "local_cnn_negative_slope"
+        ],
     ).to(device)
 
     ctx_enc.load_state_dict(

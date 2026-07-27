@@ -13,17 +13,25 @@ The image-only model is conditioned exclusively on three jet-image channels:
 The neutral image is flattened from 9x9 to 81 pixels.
 Each charged image is flattened directly from 36x36 to 1296 pixels.
 
-Context vector Y:
+Raw context:
     [0:81]       ch_neutral_all_raw
     [81:1377]    ch_charged_pu
     [1377:2673]  ch_charged_lv
+
+Learned same-resolution local context:
+    [2673:2754]  neutral local CNN map
+    [2754:4050]  charged-PU local CNN map
+    [4050:5346]  charged-LV local CNN map
+
+Total context dimension:
+    5346
 
 Target vector X:
     [0:81]       ch_neutral_lv
 
 The flow therefore learns:
 
-    v_theta(z_t, t, Y): R^81 x R x R^2673 -> R^81
+    v_theta(z_t, t, Y): R^81 x R x R^5346 -> R^81
 
 References:
     Vaselli et al. arXiv:2402.13684v2
@@ -51,7 +59,24 @@ IMG_DIM = NEUTRAL_DIM
 N_IMAGES = 3
 N_SCALARS = 0
 N_TARGET = NEUTRAL_DIM
-N_CONTEXT = NEUTRAL_DIM + 2 * CHARGED_DIM
+
+# Original flattened image context:
+#
+#   neutral all :  9x9   = 81
+#   charged PU  : 36x36  = 1296
+#   charged LV  : 36x36  = 1296
+#
+#   total raw context = 2673
+RAW_CONTEXT_DIM = NEUTRAL_DIM + 2 * CHARGED_DIM
+
+# Each CNN branch returns one same-resolution learned local feature per
+# original image pixel:
+
+#   total local context = 2673
+LOCAL_CONTEXT_DIM = NEUTRAL_DIM + 2 * CHARGED_DIM
+
+# Raw pixels plus learned same-resolution local descriptors.
+N_CONTEXT = RAW_CONTEXT_DIM + LOCAL_CONTEXT_DIM
 
 
 class SinusoidalTimeEmb(nn.Module):
@@ -82,13 +107,25 @@ class SinusoidalTimeEmb(nn.Module):
 
 class ResBlock(nn.Module):
     """
-    Residual block with repeated time and image conditioning.
+    Pre-normalized residual block with repeated time and image conditioning.
 
-    The update is approximately:
+    The update is:
 
-        h_new = LayerNorm(
-            h + Dropout(fc2(SiLU(fc1([h, condition]))))
+        h_normalized = LayerNorm(h)
+
+        residual = Dropout(
+            fc2(
+                SiLU(
+                    fc1([h_normalized, condition])
+                )
+            )
         )
+
+        h_new = h + residual
+
+    LayerNorm is applied only to the input of the residual transformation.
+    The identity path remains unchanged, allowing the hidden-state magnitude
+    to carry information through the network.
     """
 
     def __init__(
@@ -99,23 +136,125 @@ class ResBlock(nn.Module):
     ):
         super().__init__()
 
-        self.fc1 = nn.Linear(hidden_dim + cond_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        if hidden_dim <= 0:
+            raise ValueError(
+                f"hidden_dim must be positive, got {hidden_dim}"
+            )
+
+        if cond_dim <= 0:
+            raise ValueError(
+                f"cond_dim must be positive, got {cond_dim}"
+            )
+
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(
+                "dropout must satisfy 0 <= dropout < 1, "
+                f"got {dropout}"
+            )
+
+        self.norm = nn.LayerNorm(
+            hidden_dim
+        )
+
+        self.fc1 = nn.Linear(
+            hidden_dim + cond_dim,
+            hidden_dim,
+        )
+
         self.act = nn.SiLU()
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(p=dropout)
+
+        self.fc2 = nn.Linear(
+            hidden_dim,
+            hidden_dim,
+        )
+
+        self.dropout = nn.Dropout(
+            p=dropout
+        )
 
     def forward(
         self,
         h: torch.Tensor,
         cond: torch.Tensor,
     ) -> torch.Tensor:
-        residual = self.fc1(torch.cat([h, cond], dim=-1))
-        residual = self.act(residual)
-        residual = self.fc2(residual)
-        residual = self.dropout(residual)
-        return self.norm(h + residual)
+        """
+        Apply one pre-normalized residual update.
 
+        Parameters
+        ----------
+        h:
+            Hidden state with shape ``(N, hidden_dim)``.
+
+        cond:
+            Concatenated time and image context with shape
+            ``(N, cond_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Updated hidden state with the same shape as ``h``.
+        """
+        if h.ndim != 2:
+            raise ValueError(
+                "Expected h to have shape (N, hidden_dim), "
+                f"got {tuple(h.shape)}"
+            )
+
+        if cond.ndim != 2:
+            raise ValueError(
+                "Expected cond to have shape (N, cond_dim), "
+                f"got {tuple(cond.shape)}"
+            )
+
+        if h.shape[0] != cond.shape[0]:
+            raise ValueError(
+                "Hidden state and condition have different batch sizes: "
+                f"{h.shape[0]} and {cond.shape[0]}"
+            )
+
+        # Normalize only the input to the learned residual transformation.
+        # The original h remains untouched along the identity connection.
+        h_normalized = self.norm(
+            h
+        )
+
+        residual = self.fc1(
+            torch.cat(
+                [
+                    h_normalized,
+                    cond,
+                ],
+                dim=-1,
+            )
+        )
+
+        residual = self.act(
+            residual
+        )
+
+        residual = self.fc2(
+            residual
+        )
+
+        residual = self.dropout(
+            residual
+        )
+
+        output = h + residual
+
+        if output.shape != h.shape:
+            raise RuntimeError(
+                "Residual block changed the hidden-state shape: "
+                f"input={tuple(h.shape)}, "
+                f"output={tuple(output.shape)}"
+            )
+
+        if not torch.isfinite(output).all():
+            raise RuntimeError(
+                "Residual block produced non-finite values."
+            )
+
+        return output
 
 class CRTVelocityField(nn.Module):
     """
@@ -129,8 +268,9 @@ class CRTVelocityField(nn.Module):
         Flow-state and target dimensionality. PileFlow uses 81.
 
     context_dim:
-        Conditioning-vector dimensionality. Mixed-resolution PileFlow uses
-        2673: 81 neutral pixels and two sets of 1296 charged pixels.
+        Conditioning-vector dimensionality. Local-context PileFlow uses 5346:
+        2673 original flattened pixels plus 2673 same-resolution learned
+        local CNN features.
 
     hidden_dim:
         Width of the residual network.
@@ -362,26 +502,158 @@ class TargetCFM(nn.Module):
 
         return z
 
+class LocalImageEncoder(nn.Module):
+    """
+    Extract one learned local descriptor at every input pixel.
+
+    The encoder preserves the original spatial resolution:
+
+        (N, 1, H, W) -> (N, 1, H, W)
+
+    There is no pooling, striding, interpolation, or downsampling.
+
+    The two 3x3 convolutions allow each output pixel to use information from
+    a local neighborhood. The final 1x1 convolution compresses the hidden
+    channels into one learned local feature per original pixel.
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int = 8,
+        negative_slope: float = 0.1,
+    ):
+        super().__init__()
+
+        if hidden_channels <= 0:
+            raise ValueError(
+                "hidden_channels must be positive, "
+                f"got {hidden_channels}"
+            )
+
+        if not 0.0 < negative_slope < 1.0:
+            raise ValueError(
+                "negative_slope must lie in (0, 1), "
+                f"got {negative_slope}"
+            )
+
+        self.hidden_channels = hidden_channels
+        self.negative_slope = negative_slope
+
+        self.network = nn.Sequential(
+            nn.Conv2d(
+                in_channels=1,
+                out_channels=hidden_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
+            nn.LeakyReLU(
+                negative_slope=negative_slope,
+                inplace=False,
+            ),
+            nn.Conv2d(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
+            nn.LeakyReLU(
+                negative_slope=negative_slope,
+                inplace=False,
+            ),
+            nn.Conv2d(
+                in_channels=hidden_channels,
+                out_channels=1,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+            ),
+        )
+
+    def forward(
+        self,
+        image: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Encode one image channel without changing its spatial resolution.
+
+        Parameters
+        ----------
+        image:
+            Tensor with shape ``(N, 1, H, W)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Learned local feature map with shape ``(N, 1, H, W)``.
+        """
+        if image.ndim != 4:
+            raise ValueError(
+                "Expected image to have four dimensions "
+                "(N, 1, H, W), "
+                f"got {tuple(image.shape)}"
+            )
+
+        if image.shape[1] != 1:
+            raise ValueError(
+                "Expected exactly one input image channel, "
+                f"got shape {tuple(image.shape)}"
+            )
+
+        output = self.network(image)
+
+        if output.shape != image.shape:
+            raise RuntimeError(
+                "LocalImageEncoder changed the image shape: "
+                f"input={tuple(image.shape)}, "
+                f"output={tuple(output.shape)}"
+            )
+
+        return output
+
 
 class ContextEncoder(nn.Module):
     """
-    Assemble the mixed-resolution 2673-dimensional context vector.
+    Build the raw-plus-local mixed-resolution context vector.
 
     Inputs
     ------
     ch_neutral_all:
-        Contaminated neutral image, shape (N, 81).
+        Contaminated neutral image, flattened to shape ``(N, 81)``.
 
     ch_charged_pu:
-        Charged pileup image, shape (N, 1296).
+        Charged-pileup image, flattened to shape ``(N, 1296)``.
 
     ch_charged_lv:
-        Charged leading-vertex image, shape (N, 1296).
+        Charged leading-vertex image, flattened to shape ``(N, 1296)``.
 
-    Output
-    ------
-    context:
-        Standardized and concatenated image context, shape (N, 2673).
+    Processing
+    ----------
+    1. Fit and apply per-pixel standardization.
+    2. Preserve the original standardized flattened pixels.
+    3. Reshape each channel to its native image grid.
+    4. Apply a separate same-resolution CNN to each channel.
+    5. Flatten the three local CNN maps.
+    6. Concatenate raw and local features.
+
+    Context layout
+    --------------
+    Raw context:
+
+        neutral raw       : 81
+        charged-PU raw    : 1296
+        charged-LV raw    : 1296
+
+    Local CNN context:
+
+        neutral local     : 81
+        charged-PU local  : 1296
+        charged-LV local  : 1296
+
+    Total:
+
+        2673 raw + 2673 local = 5346
 
     Call ``fit`` using training rows only before training.
     """
@@ -390,6 +662,8 @@ class ContextEncoder(nn.Module):
         self,
         neutral_dim: int = NEUTRAL_DIM,
         charged_dim: int = CHARGED_DIM,
+        local_hidden_channels: int = 8,
+        local_negative_slope: float = 0.1,
     ):
         super().__init__()
 
@@ -403,9 +677,65 @@ class ContextEncoder(nn.Module):
                 f"charged_dim must be positive, got {charged_dim}"
             )
 
+        neutral_side = math.isqrt(neutral_dim)
+        charged_side = math.isqrt(charged_dim)
+
+        if neutral_side * neutral_side != neutral_dim:
+            raise ValueError(
+                "neutral_dim must describe a square image, "
+                f"got {neutral_dim}"
+            )
+
+        if charged_side * charged_side != charged_dim:
+            raise ValueError(
+                "charged_dim must describe a square image, "
+                f"got {charged_dim}"
+            )
+
+        if local_hidden_channels <= 0:
+            raise ValueError(
+                "local_hidden_channels must be positive, "
+                f"got {local_hidden_channels}"
+            )
+
+        if not 0.0 < local_negative_slope < 1.0:
+            raise ValueError(
+                "local_negative_slope must lie in (0, 1), "
+                f"got {local_negative_slope}"
+            )
+
         self.neutral_dim = neutral_dim
         self.charged_dim = charged_dim
-        self.context_dim = neutral_dim + 2 * charged_dim
+
+        self.neutral_side = neutral_side
+        self.charged_side = charged_side
+
+        self.local_hidden_channels = local_hidden_channels
+        self.local_negative_slope = local_negative_slope
+
+        self.raw_context_dim = neutral_dim + 2 * charged_dim
+        self.local_context_dim = neutral_dim + 2 * charged_dim
+        self.context_dim = (
+            self.raw_context_dim
+            + self.local_context_dim
+        )
+
+        # Separate CNN weights are used because the three channels have
+        # physically different meanings.
+        self.neutral_local_encoder = LocalImageEncoder(
+            hidden_channels=local_hidden_channels,
+            negative_slope=local_negative_slope,
+        )
+
+        self.charged_pu_local_encoder = LocalImageEncoder(
+            hidden_channels=local_hidden_channels,
+            negative_slope=local_negative_slope,
+        )
+
+        self.charged_lv_local_encoder = LocalImageEncoder(
+            hidden_channels=local_hidden_channels,
+            negative_slope=local_negative_slope,
+        )
 
         self.register_buffer(
             "neutral_all_mean",
@@ -415,6 +745,7 @@ class ContextEncoder(nn.Module):
             "neutral_all_std",
             torch.ones(neutral_dim),
         )
+
         self.register_buffer(
             "charged_pu_mean",
             torch.zeros(charged_dim),
@@ -423,6 +754,7 @@ class ContextEncoder(nn.Module):
             "charged_pu_std",
             torch.ones(charged_dim),
         )
+
         self.register_buffer(
             "charged_lv_mean",
             torch.zeros(charged_dim),
@@ -449,8 +781,37 @@ class ContextEncoder(nn.Module):
         tensor: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mean = tensor.mean(dim=0)
-        std = tensor.std(dim=0, unbiased=False).clamp(min=1e-6)
+
+        std = tensor.std(
+            dim=0,
+            unbiased=False,
+        ).clamp(min=1.0e-6)
+
         return mean, std
+
+    @staticmethod
+    def _reshape_flat_image(
+        image: torch.Tensor,
+        side: int,
+        name: str,
+    ) -> torch.Tensor:
+        """
+        Reshape ``(N, side*side)`` into ``(N, 1, side, side)``.
+        """
+        expected_dim = side * side
+
+        if image.ndim != 2 or image.shape[1] != expected_dim:
+            raise ValueError(
+                f"Expected {name} shape (N, {expected_dim}), "
+                f"got {tuple(image.shape)}"
+            )
+
+        return image.reshape(
+            image.shape[0],
+            1,
+            side,
+            side,
+        )
 
     @torch.no_grad()
     def fit(
@@ -459,17 +820,25 @@ class ContextEncoder(nn.Module):
         ch_charged_pu: torch.Tensor,
         ch_charged_lv: torch.Tensor,
     ) -> None:
-        """Fit per-pixel normalization statistics using training data only."""
+        """
+        Fit per-pixel normalization statistics using training rows only.
+
+        Only the deterministic normalization buffers are fitted here.
+        The CNN parameters are learned through gradient descent during
+        PileFlow training.
+        """
         self._validate_image(
             ch_neutral_all,
             "ch_neutral_all",
             self.neutral_dim,
         )
+
         self._validate_image(
             ch_charged_pu,
             "ch_charged_pu",
             self.charged_dim,
         )
+
         self._validate_image(
             ch_charged_lv,
             "ch_charged_lv",
@@ -481,16 +850,41 @@ class ContextEncoder(nn.Module):
             == ch_charged_pu.shape[0]
             == ch_charged_lv.shape[0]
         ):
-            raise ValueError("Context image channels have different row counts.")
+            raise ValueError(
+                "Context image channels have different row counts."
+            )
 
-        self.neutral_all_mean, self.neutral_all_std = self._stats(
+        neutral_mean, neutral_std = self._stats(
             ch_neutral_all
         )
-        self.charged_pu_mean, self.charged_pu_std = self._stats(
+
+        charged_pu_mean, charged_pu_std = self._stats(
             ch_charged_pu
         )
-        self.charged_lv_mean, self.charged_lv_std = self._stats(
+
+        charged_lv_mean, charged_lv_std = self._stats(
             ch_charged_lv
+        )
+
+        self.neutral_all_mean.copy_(
+            neutral_mean
+        )
+        self.neutral_all_std.copy_(
+            neutral_std
+        )
+
+        self.charged_pu_mean.copy_(
+            charged_pu_mean
+        )
+        self.charged_pu_std.copy_(
+            charged_pu_std
+        )
+
+        self.charged_lv_mean.copy_(
+            charged_lv_mean
+        )
+        self.charged_lv_std.copy_(
+            charged_lv_std
         )
 
     def forward(
@@ -499,17 +893,26 @@ class ContextEncoder(nn.Module):
         ch_charged_pu: torch.Tensor,
         ch_charged_lv: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the standardized 2673-dimensional context vector."""
+        """
+        Return the standardized raw-plus-local context vector.
+
+        Returns
+        -------
+        torch.Tensor
+            Context with shape ``(N, 5346)`` for the default image sizes.
+        """
         self._validate_image(
             ch_neutral_all,
             "ch_neutral_all",
             self.neutral_dim,
         )
+
         self._validate_image(
             ch_charged_pu,
             "ch_charged_pu",
             self.charged_dim,
         )
+
         self._validate_image(
             ch_charged_lv,
             "ch_charged_lv",
@@ -521,32 +924,97 @@ class ContextEncoder(nn.Module):
             == ch_charged_pu.shape[0]
             == ch_charged_lv.shape[0]
         ):
-            raise ValueError("Context image channels have different row counts.")
+            raise ValueError(
+                "Context image channels have different row counts."
+            )
 
+        # Standardized original flattened pixels.
         neutral_all_z = (
-            ch_neutral_all - self.neutral_all_mean
+            ch_neutral_all
+            - self.neutral_all_mean
         ) / self.neutral_all_std
 
         charged_pu_z = (
-            ch_charged_pu - self.charged_pu_mean
+            ch_charged_pu
+            - self.charged_pu_mean
         ) / self.charged_pu_std
 
         charged_lv_z = (
-            ch_charged_lv - self.charged_lv_mean
+            ch_charged_lv
+            - self.charged_lv_mean
         ) / self.charged_lv_std
 
+        # Restore native spatial layouts solely for the local CNN branches.
+        # No pixels are discarded or downsampled.
+        neutral_image = self._reshape_flat_image(
+            neutral_all_z,
+            side=self.neutral_side,
+            name="standardized neutral image",
+        )
+
+        charged_pu_image = self._reshape_flat_image(
+            charged_pu_z,
+            side=self.charged_side,
+            name="standardized charged-PU image",
+        )
+
+        charged_lv_image = self._reshape_flat_image(
+            charged_lv_z,
+            side=self.charged_side,
+            name="standardized charged-LV image",
+        )
+
+        # Same-resolution learned local descriptors.
+        neutral_local = self.neutral_local_encoder(
+            neutral_image
+        ).flatten(start_dim=1)
+
+        charged_pu_local = self.charged_pu_local_encoder(
+            charged_pu_image
+        ).flatten(start_dim=1)
+
+        charged_lv_local = self.charged_lv_local_encoder(
+            charged_lv_image
+        ).flatten(start_dim=1)
+
         context = torch.cat(
-            [neutral_all_z, charged_pu_z, charged_lv_z],
+            [
+                # Original information.
+                neutral_all_z,
+                charged_pu_z,
+                charged_lv_z,
+
+                # Added explicit local information.
+                neutral_local,
+                charged_pu_local,
+                charged_lv_local,
+            ],
             dim=-1,
         )
 
         if context.shape[1] != self.context_dim:
             raise RuntimeError(
-                f"Expected encoded context dimension {self.context_dim}, "
+                "Encoded context has the wrong dimension: "
+                f"expected {self.context_dim}, "
                 f"got {context.shape[1]}"
             )
 
+        if not torch.isfinite(context).all():
+            raise RuntimeError(
+                "Encoded context contains non-finite values."
+            )
+
         return context
+
+    def count_parameters(self) -> int:
+        """
+        Return the number of trainable local-CNN parameters.
+        """
+        return sum(
+            parameter.numel()
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
 
 
 class TargetPreprocessor(nn.Module):
@@ -685,11 +1153,14 @@ __all__ = [
     "N_IMAGES",
     "N_SCALARS",
     "N_TARGET",
+    "RAW_CONTEXT_DIM",
+    "LOCAL_CONTEXT_DIM",
     "N_CONTEXT",
     "SinusoidalTimeEmb",
     "ResBlock",
     "CRTVelocityField",
     "TargetCFM",
+    "LocalImageEncoder",
     "ContextEncoder",
     "TargetPreprocessor",
 ]

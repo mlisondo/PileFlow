@@ -2,11 +2,12 @@
 flows/config.py
 ===============
 
-Central configuration for the mixed-resolution image-only PileFlow pipeline.
+Central configuration for the mixed-resolution local-context PileFlow
+pipeline.
 
 Pipeline stages:
-  Stage 1 - Load generated jet images from jets_pileup_images.npz
-  Stage 2 - Train PileFlow using only three image channels
+  Stage 1 - Load generated jet images from an existing NPZ file
+  Stage 2 - Train PileFlow using raw image pixels plus learned local features
   Stage 3 - Generate the neutral-LV 9x9 image
   Stage 4 - Compare and plot predictions
 
@@ -15,16 +16,41 @@ PileFlow input channels:
   2. ch_charged_pu      - charged pileup image, native 36x36
   3. ch_charged_lv      - charged leading-vertex image, native 36x36
 
-PileFlow context:
-  81 + 1296 + 1296 = 2673 features
+Raw PileFlow context:
+  neutral all :  9x9   = 81
+  charged PU  : 36x36  = 1296
+  charged LV  : 36x36  = 1296
+
+  total raw context = 2673
+
+Local CNN context:
+  Each image channel is processed by its own same-resolution CNN:
+
+      3x3 convolution
+      LeakyReLU
+      3x3 convolution
+      LeakyReLU
+      1x1 convolution
+
+  The CNNs do not use pooling, striding, interpolation, or downsampling.
+  Each branch returns one learned local feature per original image pixel.
+
+  neutral local    :  9x9   = 81
+  charged-PU local : 36x36  = 1296
+  charged-LV local : 36x36  = 1296
+
+  total local context = 2673
+
+Total PileFlow context:
+  2673 raw + 2673 local = 5346 features
 
 PileFlow target:
-  ch_neutral_lv - neutral leading-vertex image, 9x9
+  ch_neutral_lv - neutral leading-vertex image, 9x9 = 81 features
 
 Evaluation sampling:
   During evaluation, PileFlow may generate multiple independent samples for
-  each conditioning input. The samples are averaged pixel-by-pixel before
-  computing images, jet observables, plots, and metrics.
+  each conditioning input. The decoded images are averaged pixel-by-pixel
+  before computing images, jet observables, plots, and metrics.
 
   eval_samples = 1 preserves the original single-sample behavior.
 """
@@ -57,11 +83,21 @@ class Config:
     flow_batch: int = 512
     flow_lr: float = 1e-4
     flow_hidden: int = 512
-    flow_blocks: int = 8
+    flow_blocks: int = 5
     flow_time_emb: int = 64
     flow_sigma_min: float = 1e-4
     flow_dropout: float = 0.1
     flow_patience: int = 60
+
+    # Full-resolution local CNN context.
+    #
+    # Each of the three image channels receives its own CNN branch.
+    # The hidden layers use this many channels, while the final 1x1 convolution
+    # compresses the result to one learned local feature per original pixel.
+    flow_local_hidden: int = 8
+
+    # Negative slope used by LeakyReLU inside the local CNN branches.
+    flow_local_negative_slope: float = 0.1
 
     # Generation / evaluation
     eval_batch: int = 512
@@ -100,17 +136,49 @@ class Config:
         return len(self.image_channel_keys)
 
     @property
-    def context_dim(self) -> int:
+    def raw_context_dim(self) -> int:
         """
-        Mixed-resolution context dimension:
+        Dimension of the original flattened image context.
 
-            neutral all:  9x9   = 81
-            charged PU:  36x36  = 1296
-            charged LV:  36x36  = 1296
+        Layout:
+            neutral all :  9x9   = 81
+            charged PU  : 36x36  = 1296
+            charged LV  : 36x36  = 1296
 
-            total = 2673
+        Default total:
+            81 + 1296 + 1296 = 2673
         """
         return self.neutral_dim + 2 * self.charged_dim
+
+
+    @property
+    def local_context_dim(self) -> int:
+        """
+        Dimension of the learned same-resolution local CNN context.
+
+        Each CNN branch returns one feature per original image pixel:
+
+            neutral local    :  9x9   = 81
+            charged-PU local : 36x36  = 1296
+            charged-LV local : 36x36  = 1296
+
+        Default total:
+            81 + 1296 + 1296 = 2673
+        """
+        return self.neutral_dim + 2 * self.charged_dim
+
+
+    @property
+    def context_dim(self) -> int:
+        """
+        Total raw-plus-local conditioning dimension.
+
+        Default:
+            raw context   = 2673
+            local context = 2673
+            total context = 5346
+        """
+        return self.raw_context_dim + self.local_context_dim
 
     @property
     def n_target(self) -> int:
@@ -204,6 +272,51 @@ class Config:
             raise ValueError(
                 "flow_dropout must satisfy 0 <= flow_dropout < 1, "
                 f"got {self.flow_dropout}"
+            )
+        
+        if self.flow_local_hidden <= 0:
+            raise ValueError(
+                "flow_local_hidden must be a positive integer, "
+                f"got {self.flow_local_hidden}"
+            )
+
+        if not 0.0 < self.flow_local_negative_slope < 1.0:
+            raise ValueError(
+                "flow_local_negative_slope must lie strictly inside "
+                "(0, 1), "
+                f"got {self.flow_local_negative_slope}"
+            )
+
+        expected_raw_context = (
+            self.neutral_dim
+            + 2 * self.charged_dim
+        )
+
+        if self.raw_context_dim != expected_raw_context:
+            raise RuntimeError(
+                "Raw context dimension is inconsistent with the configured "
+                "image sizes: "
+                f"expected {expected_raw_context}, "
+                f"got {self.raw_context_dim}"
+            )
+
+        if self.local_context_dim != expected_raw_context:
+            raise RuntimeError(
+                "Local CNN context must currently contain exactly one "
+                "same-resolution feature per original image pixel: "
+                f"expected {expected_raw_context}, "
+                f"got {self.local_context_dim}"
+            )
+
+        expected_total_context = (
+            2 * expected_raw_context
+        )
+
+        if self.context_dim != expected_total_context:
+            raise RuntimeError(
+                "Total raw-plus-local context dimension is inconsistent: "
+                f"expected {expected_total_context}, "
+                f"got {self.context_dim}"
             )
 
     # Generic
