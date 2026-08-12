@@ -120,7 +120,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-npy",
         default=None,
-        help="Optional .npy table used only by comparison code.",
+        help="Optional .npy table used only by comparison code (training set).",
+    )
+    parser.add_argument(
+        "--eval-npz",
+        default=None,
+        help=(
+            "Held-out evaluation .npz file.  When provided, physics metrics are "
+            "computed on this dataset instead of the training .npz.  "
+            "Recommended: use the *_eval.npz split generated alongside *_train.npz."
+        ),
+    )
+    parser.add_argument(
+        "--eval-npy",
+        default=None,
+        help="Optional .npy table for the held-out evaluation set (comparison plots).",
     )
     parser.add_argument(
         "--flow-ckpt",
@@ -193,8 +207,183 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument(
         "--flow-patience",
         type=int,
-        default=60,
+        default=120,
         help="Use 0 to disable early stopping.",
+    )
+
+    # Minor improvement flags
+    improve = parser.add_argument_group(
+        "Minor improvements (all enabled by default)"
+    )
+    improve.add_argument(
+        "--use-log-pt",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Apply log(1+pT) normalization to the target image.",
+    )
+    improve.add_argument(
+        "--use-minibatch-ot",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Use minibatch OT noise coupling (requires scipy).",
+    )
+    improve.add_argument(
+        "--use-ema",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Maintain an EMA of model weights during training.",
+    )
+    improve.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="EMA decay rate (used only when --use-ema).",
+    )
+    improve.add_argument(
+        "--pt-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Pixel pT threshold in GeV applied at decode time. "
+            "Pixels below this value are zeroed. 0 = disabled."
+        ),
+    )
+    improve.add_argument(
+        "--use-cnn-context",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Use standalone CNN context encoder (superseded by --use-transformer). "
+            "Only active when --no-use-transformer is also passed."
+        ),
+    )
+    improve.add_argument(
+        "--cnn-neutral-feat",
+        type=int,
+        default=128,
+        help="CNN output features for the 9x9 neutral channel (standalone CNN encoder).",
+    )
+    improve.add_argument(
+        "--cnn-charged-feat",
+        type=int,
+        default=256,
+        help="CNN output features for each 36x36 charged channel (standalone CNN encoder).",
+    )
+
+    # Patch-token set transformer
+    pst = parser.add_argument_group(
+        "Patch-token set transformer (patch-per-pixel, global attention)"
+    )
+    pst.add_argument(
+        "--use-set-transformer",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Replace the velocity field with a patch-token set transformer. "
+            "81 tokens, one per output pixel; each token receives a 4×4 patch "
+            "from each charged channel + one neutral pixel + explicit (η,φ). "
+            "Full global SAB attention O(81²) by default; use --st-n-inducing "
+            "for ISAB (O(N·m))."
+        ),
+    )
+    pst.add_argument(
+        "--st-d-model",
+        type=int,
+        default=256,
+        help="Set-transformer hidden dimension (must be divisible by 4 and n_heads).",
+    )
+    pst.add_argument(
+        "--st-n-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads per SAB/ISAB block.",
+    )
+    pst.add_argument(
+        "--st-n-layers",
+        type=int,
+        default=6,
+        help="Number of SAB or ISAB blocks.",
+    )
+    pst.add_argument(
+        "--st-n-inducing",
+        type=int,
+        default=0,
+        help=(
+            "Number of inducing points per ISAB block. "
+            "0 = use full SAB (global O(N²) attention). "
+            ">0 = use ISAB (O(N·m) attention)."
+        ),
+    )
+
+    # U-Net velocity field
+    unet = parser.add_argument_group(
+        "U-Net velocity field (drastic change)"
+    )
+    unet.add_argument(
+        "--use-unet",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Replace the flat residual MLP with a U-Net velocity field. "
+            "Processes charged images at native 36×36, encodes 36→18→9, "
+            "merges with neutral+z_t at 9×9, bottleneck at 4×4 with skip. "
+            "Pass --no-use-unet to revert to the flat ResNet."
+        ),
+    )
+    unet.add_argument(
+        "--unet-base-channels",
+        type=int,
+        default=64,
+        help=(
+            "Base channel count C for the U-Net. "
+            "Encoder uses C→2C→4C; bottleneck uses 8C. "
+            "Use 32 for speed (~1M params), 64 for quality (~4M params)."
+        ),
+    )
+
+    # Transformer velocity field
+    xfm = parser.add_argument_group(
+        "Transformer velocity field (drastic change)"
+    )
+    xfm.add_argument(
+        "--use-transformer",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Replace the flat residual MLP with a Transformer velocity field. "
+            "Each output pixel cross-attends to all 243 context tokens. "
+            "Pass --no-use-transformer to revert to the flat ResNet."
+        ),
+    )
+    xfm.add_argument(
+        "--transformer-d-model",
+        type=int,
+        default=256,
+        help="Transformer hidden dimension.",
+    )
+    xfm.add_argument(
+        "--transformer-n-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads (must evenly divide --transformer-d-model).",
+    )
+    xfm.add_argument(
+        "--transformer-n-self-attn",
+        type=int,
+        default=2,
+        help="Number of self-attention layers over the 243 context tokens.",
+    )
+    xfm.add_argument(
+        "--transformer-n-cross-attn",
+        type=int,
+        default=4,
+        help="Number of cross-attention layers (81 target tokens × 243 context tokens).",
+    )
+    xfm.add_argument(
+        "--transformer-cnn-channels",
+        type=int,
+        default=32,
+        help="CNN feature channels used to map each image channel to 9×9 tokens.",
     )
 
     # Generation and evaluation
@@ -207,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-samples",
         type=int,
-        default=1,
+        default=8,
         help=(
             "Number of independent PileFlow samples generated per jet. "
             "The decoded images are averaged pixel-by-pixel before "
@@ -421,12 +610,10 @@ def _mean_npu(
 def main() -> None:
     args = build_parser().parse_args()
 
-    data_npz = _abs_path(
-        args.data_npz
-    )
-    comparison_npy = _abs_path(
-        args.data_npy
-    )
+    data_npz = _abs_path(args.data_npz)
+    comparison_npy = _abs_path(args.data_npy)
+    eval_npz = _abs_path(args.eval_npz)
+    eval_npy = _abs_path(args.eval_npy)
     flow_ckpt_arg = _abs_path(
         args.flow_ckpt
     )
@@ -441,6 +628,8 @@ def main() -> None:
         skip_flow=args.skip_flow,
         skip_eval=args.skip_eval,
         data_npz=data_npz,
+        eval_npz=eval_npz,
+        eval_npy=eval_npy,
         flow_ckpt=flow_ckpt_arg,
         pumml_ckpt=pumml_ckpt,
         max_jets=args.max_jets,
@@ -453,8 +642,30 @@ def main() -> None:
         flow_sigma_min=args.flow_sigma_min,
         flow_dropout=args.flow_dropout,
         flow_patience=args.flow_patience,
+        use_log_pt=args.use_log_pt,
+        use_minibatch_ot=args.use_minibatch_ot,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
+        pt_threshold=args.pt_threshold,
+        use_cnn_context=args.use_cnn_context,
+        cnn_neutral_feat=args.cnn_neutral_feat,
+        cnn_charged_feat=args.cnn_charged_feat,
+        use_set_transformer=args.use_set_transformer,
+        st_d_model=args.st_d_model,
+        st_n_heads=args.st_n_heads,
+        st_n_layers=args.st_n_layers,
+        st_n_inducing=args.st_n_inducing,
+        use_unet=args.use_unet,
+        unet_base_channels=args.unet_base_channels,
+        use_transformer=args.use_transformer,
+        transformer_d_model=args.transformer_d_model,
+        transformer_n_heads=args.transformer_n_heads,
+        transformer_n_self_attn=args.transformer_n_self_attn,
+        transformer_n_cross_attn=args.transformer_n_cross_attn,
+        transformer_cnn_channels=args.transformer_cnn_channels,
         eval_batch=args.eval_batch,
         eval_samples=args.eval_samples,
+        ode_steps=args.ode_steps,
         device=args.device,
         seed=args.seed,
     )
@@ -570,15 +781,20 @@ def main() -> None:
                 f"{cfg.eval_samples} neutral-LV samples per jet ..."
             )
 
+        # Use held-out eval set when available; warn if falling back to train set.
+        gen_npz = cfg.eval_npz or npz_path
+        gen_npy = cfg.eval_npy or comparison_npy
+
         results = generate_and_save(
             npz_path=npz_path,
             flow_ckpt=flow_ckpt,
             cfg=cfg,
-            n_steps=args.ode_steps,
+            n_steps=cfg.ode_steps,
             out_dir=os.path.join(
                 cfg.outdir,
                 "data",
             ),
+            eval_npz=cfg.eval_npz,
         )
 
         n_generated = results[
@@ -593,10 +809,10 @@ def main() -> None:
             f"  Samples per jet: {cfg.eval_samples}\n"
         )
 
-        if comparison_npy is None:
+        if gen_npy is None:
             print(
-                "  Comparison plots skipped because --data-npy "
-                "was not provided. Prediction generation "
+                "  Comparison plots skipped because no .npy table was provided "
+                "(use --eval-npy or --data-npy). Prediction generation "
                 "completed successfully."
             )
 
@@ -611,8 +827,8 @@ def main() -> None:
                 )
 
                 run_comparison(
-                    npz_path=npz_path,
-                    npy_path=comparison_npy,
+                    npz_path=gen_npz,
+                    npy_path=gen_npy,
                     pumml_ckpt=cfg.pumml_ckpt,
                     results=results,
                     cfg=cfg,

@@ -265,7 +265,11 @@ class TargetCFM(nn.Module):
         u_t = x1 - (1 - sigma_min)*x0
     """
 
-    def __init__(self, sigma_min: float = 1e-4):
+    def __init__(
+        self,
+        sigma_min: float = 1e-4,
+        use_minibatch_ot: bool = False,
+    ):
         super().__init__()
 
         if not 0.0 <= sigma_min < 1.0:
@@ -274,6 +278,36 @@ class TargetCFM(nn.Module):
             )
 
         self.sigma_min = sigma_min
+        self.use_minibatch_ot = use_minibatch_ot
+
+    def _sample_x0(self, x1: torch.Tensor) -> torch.Tensor:
+        """
+        Sample noise x0.
+
+        When use_minibatch_ot is True, pairs each x1_i with the nearest x0
+        from a random batch via the linear assignment problem (minibatch OT).
+        This reduces variance in the FM loss and straightens the learned paths.
+
+        Falls back to independent Gaussian sampling if scipy is unavailable.
+        """
+        x0 = torch.randn_like(x1)
+
+        if not self.use_minibatch_ot:
+            return x0
+
+        try:
+            from scipy.optimize import linear_sum_assignment
+
+            cost = torch.cdist(
+                x1.float(), x0.float(), p=2
+            ).pow(2)
+            _, col_ind = linear_sum_assignment(
+                cost.detach().cpu().numpy()
+            )
+            return x0[col_ind]
+
+        except ImportError:
+            return x0
 
     def sample_training_pair(
         self,
@@ -305,7 +339,7 @@ class TargetCFM(nn.Module):
 
         n = x1.shape[0]
         t = torch.rand(n, device=x1.device, dtype=x1.dtype)
-        x0 = torch.randn_like(x1)
+        x0 = self._sample_x0(x1)
         scale = 1.0 - (1.0 - self.sigma_min) * t[:, None]
         z_t = t[:, None] * x1 + scale * x0
         u_t = x1 - (1.0 - self.sigma_min) * x0
@@ -549,6 +583,155 @@ class ContextEncoder(nn.Module):
         return context
 
 
+class CNNContextEncoder(nn.Module):
+    """
+    CNN-based context encoder.
+
+    Replaces the flat pixel concatenation of ContextEncoder with a small
+    dedicated CNN per image channel.  Each CNN extracts spatially-aware
+    features; the outputs are concatenated into a compact context vector
+    that conditions the flow velocity field.
+
+    Context vector layout
+    ---------------------
+    [0 : neutral_feat_dim]                     neutral-all CNN features
+    [neutral_feat_dim : neutral_feat_dim + charged_feat_dim]   charged-PU CNN features
+    [neutral_feat_dim + charged_feat_dim : context_dim]        charged-LV CNN features
+
+    Inputs (all already in physical pT units, not standardised)
+    -----------------------------------------------------------
+    ch_neutral_all : (N, 81)   9x9 neutral contaminated image, flattened
+    ch_charged_pu  : (N, 1296) 36x36 charged pileup image, flattened
+    ch_charged_lv  : (N, 1296) 36x36 charged LV image, flattened
+
+    Output
+    ------
+    context : (N, context_dim)
+    """
+
+    def __init__(
+        self,
+        neutral_feat_dim: int = 128,
+        charged_feat_dim: int = 256,
+    ):
+        super().__init__()
+
+        if neutral_feat_dim <= 0:
+            raise ValueError(
+                f"neutral_feat_dim must be positive, got {neutral_feat_dim}"
+            )
+        if charged_feat_dim <= 0:
+            raise ValueError(
+                f"charged_feat_dim must be positive, got {charged_feat_dim}"
+            )
+
+        self.neutral_feat_dim = neutral_feat_dim
+        self.charged_feat_dim = charged_feat_dim
+        self.context_dim = neutral_feat_dim + 2 * charged_feat_dim
+
+        # Per-channel global normalisation statistics (fit from training data).
+        # Registered as scalars (shape []) to match what fit() stores via .mean()/.std().
+        self.register_buffer("neutral_mean", torch.zeros(()))
+        self.register_buffer("neutral_std", torch.ones(()))
+        self.register_buffer("charged_pu_mean", torch.zeros(()))
+        self.register_buffer("charged_pu_std", torch.ones(()))
+        self.register_buffer("charged_lv_mean", torch.zeros(()))
+        self.register_buffer("charged_lv_std", torch.ones(()))
+
+        # CNN for the 9x9 neutral-all image.
+        self.neutral_cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(64, neutral_feat_dim),
+            nn.SiLU(),
+        )
+
+        # CNNs for the 36x36 charged images (separate weights — different physics).
+        def _make_charged_cnn() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(1, 32, kernel_size=3, padding=1, stride=2),  # 18x18
+                nn.SiLU(),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),  # 9x9
+                nn.SiLU(),
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),  # 9x9
+                nn.SiLU(),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(128, charged_feat_dim),
+                nn.SiLU(),
+            )
+
+        self.charged_pu_cnn = _make_charged_cnn()
+        self.charged_lv_cnn = _make_charged_cnn()
+
+        # Layer-norm on the concatenated output stabilises early training.
+        self.output_norm = nn.LayerNorm(self.context_dim)
+
+    @staticmethod
+    def _global_stats(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mean = tensor.mean()
+        std = tensor.std().clamp(min=1e-6)
+        return mean, std
+
+    @torch.no_grad()
+    def fit(
+        self,
+        ch_neutral_all: torch.Tensor,
+        ch_charged_pu: torch.Tensor,
+        ch_charged_lv: torch.Tensor,
+    ) -> None:
+        """Fit per-channel global normalisation statistics from training data."""
+        self.neutral_mean, self.neutral_std = self._global_stats(ch_neutral_all)
+        self.charged_pu_mean, self.charged_pu_std = self._global_stats(ch_charged_pu)
+        self.charged_lv_mean, self.charged_lv_std = self._global_stats(ch_charged_lv)
+
+    def forward(
+        self,
+        ch_neutral_all: torch.Tensor,
+        ch_charged_pu: torch.Tensor,
+        ch_charged_lv: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Encode three image channels into a compact context vector.
+
+        Parameters
+        ----------
+        ch_neutral_all : (N, 81)
+        ch_charged_pu  : (N, 1296)
+        ch_charged_lv  : (N, 1296)
+
+        Returns
+        -------
+        context : (N, context_dim)
+        """
+        n = ch_neutral_all.shape[0]
+
+        # Normalise.
+        neutral = (ch_neutral_all - self.neutral_mean) / self.neutral_std
+        charged_pu = (ch_charged_pu - self.charged_pu_mean) / self.charged_pu_std
+        charged_lv = (ch_charged_lv - self.charged_lv_mean) / self.charged_lv_std
+
+        # Reshape to (N, 1, H, W) for Conv2d.
+        neutral_img = neutral.view(n, 1, NEUTRAL_SIDE, NEUTRAL_SIDE)
+        pu_img = charged_pu.view(n, 1, CHARGED_SIDE, CHARGED_SIDE)
+        lv_img = charged_lv.view(n, 1, CHARGED_SIDE, CHARGED_SIDE)
+
+        n_feat = self.neutral_cnn(neutral_img)
+        pu_feat = self.charged_pu_cnn(pu_img)
+        lv_feat = self.charged_lv_cnn(lv_img)
+
+        context = torch.cat([n_feat, pu_feat, lv_feat], dim=-1)
+        return self.output_norm(context)
+
+
 class TargetPreprocessor(nn.Module):
     """
     Standardize and decode the 81-dimensional neutral-LV target image.
@@ -566,6 +749,7 @@ class TargetPreprocessor(nn.Module):
     def __init__(
         self,
         n_img: int = N_TARGET,
+        use_log_pt: bool = False,
     ):
         super().__init__()
 
@@ -573,6 +757,7 @@ class TargetPreprocessor(nn.Module):
             raise ValueError(f"n_img must be positive, got {n_img}")
 
         self.n_img = n_img
+        self.use_log_pt = use_log_pt
 
         self.register_buffer(
             "img_mean",
@@ -602,8 +787,9 @@ class TargetPreprocessor(nn.Module):
         """Fit per-pixel target statistics using training rows only."""
         self._validate_image(neutral_lv, "neutral_lv")
 
-        self.img_mean = neutral_lv.mean(dim=0)
-        self.img_std = neutral_lv.std(
+        data = torch.log1p(neutral_lv) if self.use_log_pt else neutral_lv
+        self.img_mean = data.mean(dim=0)
+        self.img_std = data.std(
             dim=0,
             unbiased=False,
         ).clamp(min=1e-6)
@@ -626,7 +812,8 @@ class TargetPreprocessor(nn.Module):
             Standardized target image with shape (N, 81).
         """
         self._validate_image(neutral_lv, "neutral_lv")
-        return (neutral_lv - self.img_mean) / self.img_std
+        data = torch.log1p(neutral_lv) if self.use_log_pt else neutral_lv
+        return (data - self.img_mean) / self.img_std
 
     def decode(
         self,
@@ -664,6 +851,8 @@ class TargetPreprocessor(nn.Module):
             )
 
         image = z * self.img_std + self.img_mean
+        if self.use_log_pt:
+            image = torch.expm1(image)
         image = image.clamp(min=0.0)
 
         if pt_threshold is not None and pt_threshold > 0.0:
@@ -691,5 +880,6 @@ __all__ = [
     "CRTVelocityField",
     "TargetCFM",
     "ContextEncoder",
+    "CNNContextEncoder",
     "TargetPreprocessor",
 ]
