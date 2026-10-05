@@ -1,0 +1,11 @@
+# Core (training, evaluation, benchmark)
+numpy>=1.24
+scipy>=1.10
+torch>=2.1
+torchdiffeq>=0.2.3      # dopri5 sampler (euler/midpoint/rk4 work without it)
+matplotlib>=3.7
+# Tests
+pytest>=7
+# Dataset generation only (generator/gen4pf.py): Pythia8 and FastJet Python bindings
+# pythia8
+# fastjet

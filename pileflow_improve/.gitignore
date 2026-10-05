@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.npz
+*.pt
+*.png
+*.jpeg
+*.log
+runs/
+results*/
+comparison*/
+ppjj_scalar500_npu140_56k_v1.npz
